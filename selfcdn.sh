@@ -4,7 +4,7 @@
 # target: Debian/Ubuntu · RHEL/CentOS/Rocky/Alma · 需 root
 set -uo pipefail
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 
 BASE=/etc/selfcdn
 NODES_DIR=$BASE/nodes
@@ -829,7 +829,14 @@ diagnose_acme_failure() {
   if grep -qi 'rateLimited\|too many.*certificate\|too many.*identifiers' "$log" 2>/dev/null; then
     err "证书申请失败：触发 Let's Encrypt 频率限制"
     [[ -n $detail ]] && sed 's/^/      /' <<< "$detail" >&2
-    echo "    同一域名每周有签发上限。等一段时间，或先用 --staging 调试。" >&2
+    echo "    同一组域名每周最多 5 张重复证书。等一段时间，或先用 --staging 调试。" >&2
+    return 0
+  fi
+  if grep -qE 'Domain key exists|Domains are the same' "$log" 2>/dev/null; then
+    err "证书申请失败：该域名在 acme.sh 里已有证书/key，拒绝重复签发"
+    [[ -n $detail ]] && sed 's/^/      /' <<< "$detail" >&2
+    echo "    正常情况脚本会自动改为安装已有证书；走到这里说明证书文件缺失。" >&2
+    echo "    手工修复: acme.sh --issue -d $domain --ecc --force" >&2
     return 0
   fi
   if grep -qi 'DNS problem\|NXDOMAIN\|no valid A records\|dns lookup' "$log" 2>/dev/null; then
@@ -856,10 +863,60 @@ acme_log_is_fatal() {
   grep -qE 'invalidContact|forbidden domain|rateLimited|too many.*certificate' "$1" 2>/dev/null
 }
 
+# acme.sh 说"这个域已有证书/key"，重试换校验方式毫无意义，应改为直接安装现有证书
+acme_log_already_issued() {
+  grep -qE 'Domain key exists|Domains are the same|already have (an? )?(ECC |RSA )?cert|It seems that .*already|Skip, Next renewal time is' "$1" 2>/dev/null
+}
+
+# acme.sh 自己的证书目录。判"是否已签发"要看这里，不能靠 --info 的键名：
+# 实测 acme.sh 3.1.7 的 --info 只输出 Le_Domain/Le_Alt/Le_Webroot 等，
+# 不含 Le_RealCertPath / Le_CertCreateTime，靠它判会误判成"没签过"→ 重复 --issue → 撞 key exists。
+acme_cert_file() { echo "$ACME_HOME/$1_ecc/$1.cer"; }
+acme_has_cert()  { [[ -f $(acme_cert_file "$1") ]]; }
+
+# 证书剩余天数；拿不到返回 -1
+cert_days_left() {
+  local f=$1 end
+  [[ -f $f ]] || { echo -1; return; }
+  end=$(openssl x509 -enddate -noout -in "$f" 2>/dev/null | cut -d= -f2)
+  [[ -n $end ]] || { echo -1; return; }
+  local e
+  e=$(date -d "$end" +%s 2>/dev/null) || { echo -1; return; }
+  echo $(( ( e - $(date +%s) ) / 86400 ))
+}
+
 issue_cert() {
   local name=$1 mode=${2:-webroot}
   load_node "$name"
   ensure_acme || return 1
+  mkdir -p "$ACME_ROOT"
+
+  local local_cert="$CERT_DIR/$name/fullchain.cer"
+  local local_key="$CERT_DIR/$name/$DOMAIN.key"
+
+  # ---- 情形 1：acme.sh 里已有该域证书，不必重新签发 ----
+  if acme_has_cert "$DOMAIN"; then
+    local days
+    days=$(cert_days_left "$(acme_cert_file "$DOMAIN")")
+
+    # 本地副本缺失（如节点被删后重建、换了标识）→ 只做安装，一次网络请求都不用发
+    if [[ ! -f $local_cert || ! -f $local_key ]]; then
+      info "acme.sh 已有 $DOMAIN 的证书（剩余 ${days} 天），直接装到节点目录，不重新签发"
+      install_cert "$name" || return 1
+      ok "证书已就位: $CERT_DIR/$name"
+      return 0
+    fi
+
+    # 本地也有效且不临近到期 → 不动
+    local ldays
+    ldays=$(cert_days_left "$local_cert")
+    if (( ldays > 30 )); then
+      ok "证书仍有效（剩余 $ldays 天），无需签发"
+      return 0
+    fi
+    info "证书剩余 $ldays 天，执行续期"
+    mode=renew
+  fi
 
   local dns_ip server_ip
   dns_ip=$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')
@@ -871,32 +928,26 @@ issue_cert() {
     [[ $a =~ ^[Yy]$ ]] || return 1
   fi
 
-  mkdir -p "$ACME_ROOT"
   local arr=(--issue -d "$DOMAIN" --keylength ec-256 --server "$ACME_URL")
-
-  # 已签发过就直接续期，--issue 对同域会被 acme.sh 拒绝
-  local verb="issue"
-  if "$ACME_SH" --info -d "$DOMAIN" 2>/dev/null | grep -q "Le_RealCertPath\|Le_CertCreateTime"; then
-    verb="renew"
-    local rd
-    rd=$("$ACME_SH" --info -d "$DOMAIN" 2>/dev/null | awk -F= '/Le_NextRenewTimeStr/{print $2; exit}')
-    info "该域已有证书${rd:+（下次续期 $rd）}，走 renew 分支"
-  fi
-
-  info "申请证书 [$mode/$verb]: $DOMAIN"
+  info "申请证书 [$mode]: $DOMAIN"
   local rc=1
 
-  if [[ $verb == renew ]]; then
+  if [[ $mode == renew ]]; then
     "$ACME_SH" --renew -d "$DOMAIN" --ecc --server "$ACME_URL" > "$ACME_LOG" 2>&1 && rc=0
-    # 未到续期窗口时 renew 返回非 0，但证书仍有效 —— 继续走 install
-    [[ -f "$ACME_HOME/${DOMAIN}_ecc/${DOMAIN}.cer" ]] && rc=0
+    # 未到续期窗口时 renew 返回非 0，但证书仍有效
+    [[ -f $local_cert ]] && rc=0
   elif [[ $mode == webroot ]]; then
     "$ACME_SH" "${arr[@]}" -w "$ACME_ROOT" > "$ACME_LOG" 2>&1 && rc=0
     if (( rc != 0 )); then
       if acme_log_is_fatal "$ACME_LOG"; then
-        # 邮箱/频率问题换校验方式也没用，直接报原因
         diagnose_acme_failure "$ACME_LOG" "$DOMAIN"
         return 1
+      fi
+      if acme_log_already_issued "$ACME_LOG" && acme_has_cert "$DOMAIN"; then
+        info "acme.sh 报告该域证书已存在，改为直接安装"
+        install_cert "$name" || return 1
+        ok "证书已就位: $CERT_DIR/$name"
+        return 0
       fi
       warn "webroot 失败，降级 standalone 重试 ..."
       if command -v systemctl >/dev/null 2>&1; then systemctl stop nginx 2>/dev/null || true; else nginx -s stop 2>/dev/null || true; fi
@@ -910,6 +961,13 @@ issue_cert() {
   fi
 
   if (( rc != 0 )); then
+    # 兜底：签发命令失败，但证书其实已存在（key exists / 已签发），装上去就行
+    if acme_log_already_issued "$ACME_LOG" && acme_has_cert "$DOMAIN"; then
+      info "该域证书已存在，改为直接安装（不重新签发）"
+      install_cert "$name" || return 1
+      ok "证书已就位: $CERT_DIR/$name"
+      return 0
+    fi
     diagnose_acme_failure "$ACME_LOG" "$DOMAIN"
     return 1
   fi
@@ -1063,13 +1121,18 @@ del_node() {
   [[ $c == yes ]] || { warn "已取消"; pause; return; }
 
   rm -f "$NGINX_CONF_D/selfcdn-$n.conf"
-  acme_present && "$ACME_SH" --remove -d "$DOMAIN" >/dev/null 2>&1 || true
+  # 故意保留 acme.sh 里的证书：重建同域名节点时可直接装回来，不必重新签发
+  # （LE 对同一组域名每周只允许 5 张重复证书，反复删建会撞限额）
   rm -rf "$CERT_DIR/$n" "$CACHE_ROOT/$n"
   rm -f "$(node_file "$n")"
   rm -f "/var/log/nginx/selfcdn-$n.access.log" "/var/log/nginx/selfcdn-$n.error.log"
   render_global_conf
   nginx_reload || { err "重载失败：请检查 $NGINX_CONF_D"; pause; return 1; }
   ok "节点 $n 已删除"
+  if acme_has_cert "$DOMAIN"; then
+    info "acme.sh 中 $DOMAIN 的证书已保留（剩余 $(cert_days_left "$(acme_cert_file "$DOMAIN")") 天）"
+    info "再次添加同域名节点会直接复用；要彻底删除: acme.sh --remove -d $DOMAIN --ecc"
+  fi
   pause
 }
 
@@ -1255,13 +1318,14 @@ uninstall_all() {
     [[ -z $n ]] && continue
     load_node "$n"
     rm -f "$NGINX_CONF_D/selfcdn-$n.conf"
-    acme_present && "$ACME_SH" --remove -d "$DOMAIN" >/dev/null 2>&1 || true
+    # 同样保留 acme.sh 证书，避免重建时重复签发撞 LE 限额
     rm -f "/var/log/nginx/selfcdn-$n.access.log" "/var/log/nginx/selfcdn-$n.error.log"
   done < <(list_node_names)
   rm -f "$GLOBAL_CONF"
   rm -rf "$CACHE_ROOT" "$BASE" "$ACME_ROOT"
   nginx_reload || warn "重载失败，请手工检查 $NGINX_CONF_D"
   ok "已清空全部 CDN 节点"
+  info "acme.sh 里的证书已保留；彻底清理: acme.sh --remove -d <域名> --ecc"
   pause
 }
 

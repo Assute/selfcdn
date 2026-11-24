@@ -138,5 +138,78 @@ grep -q '完整日志' <<< "$OUT" \
   || { echo "  FAIL  未知错误未给日志路径"; FAIL=$((FAIL+1)); }
 
 
+echo
+echo "[10] 证书状态判定与重复签发处理"
+# 线上踩过：acme.sh 3.1.7 的 --info 不输出 Le_RealCertPath / Le_CertCreateTime，
+# 靠它判"已签发"会误判 → 重复 --issue → 撞 Domain key exists → 失败。
+mkdir -p "$ACME_HOME/demo.example.org_ecc"
+
+# git-bash(MSYS) 会把 -subj 里的 /CN=... 当路径改写，用 //CN= 变通；Linux 保持单斜杠
+subj_cn() {
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) printf "//CN=%s" "$1" ;;
+    *) printf "/CN=%s" "$1" ;;
+  esac
+}
+SELF_SIGNED=$TMP/ss.cer
+openssl req -x509 -newkey rsa:2048 -nodes -days 90 \
+  -keyout "$TMP/ss.key" -out "$SELF_SIGNED" -subj "$(subj_cn demo.example.org)" >/dev/null 2>&1
+
+nchk "无证书时 acme_has_cert 为假"      acme_has_cert "demo.example.org"
+cp "$SELF_SIGNED" "$ACME_HOME/demo.example.org_ecc/demo.example.org.cer"
+chk  "有证书时 acme_has_cert 为真"      acme_has_cert "demo.example.org"
+chk  "证书路径按 <domain>_ecc 构造"      test "$(acme_cert_file demo.example.org)" = "$ACME_HOME/demo.example.org_ecc/demo.example.org.cer"
+
+D1=$(cert_days_left "$SELF_SIGNED")
+echo "    自签 90 天证书探测剩余天数: $D1"
+chk  "剩余天数为正数（80-91）"           test "$D1" -ge 80 -a "$D1" -le 91
+chk  "不存在文件返回 -1"                test "$(cert_days_left "$TMP/nope.cer")" -eq -1
+
+# 过期证书应给出 <=0
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout "$TMP/old.key" -out "$TMP/old.cer" -subj "$(subj_cn old)" >/dev/null 2>&1
+chk  "1 天期证书 <=1"                   test "$(cert_days_left "$TMP/old.cer")" -le 1
+
+echo
+echo "[11] acme 输出里的\"已存在\"签名"
+echo '[Tue] Domain key exists, do you want to overwrite it?' > "$TMP/k1"
+echo "    add '--force' and try again." >> "$TMP/k1"
+acme_log_already_issued "$TMP/k1" \
+  && { echo "  PASS  Domain key exists 识别为已存在"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  Domain key exists 未识别"; FAIL=$((FAIL+1)); }
+
+echo '[Tue] Domains are the same, Please use --force to renew.' > "$TMP/k2"
+acme_log_already_issued "$TMP/k2" \
+  && { echo "  PASS  Domains are the same 识别为已存在"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  Domains are the same 未识别"; FAIL=$((FAIL+1)); }
+
+echo '[Tue] Skip, Next renewal time is: 2027-02-22' > "$TMP/k3"
+acme_log_already_issued "$TMP/k3" \
+  && { echo "  PASS  未到续期窗口识别为已存在"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  未到续期窗口未识别"; FAIL=$((FAIL+1)); }
+
+echo '[Tue] Creating domain key' > "$TMP/k4"
+acme_log_already_issued "$TMP/k4" \
+  && { echo "  FAIL  正常签发改判为已存在"; FAIL=$((FAIL+1)); } \
+  || { echo "  PASS  正常签发不误判"; PASS=$((PASS+1)); }
+
+echo
+echo "[12] 已存在签名的诊断文案"
+OUT=$( { diagnose_acme_failure "$TMP/k1" "demo.example.org"; } 2>&1 | sed 's/\x1b\[[0-9;]*m//g' )
+grep -q '已有证书/key' <<< "$OUT" \
+  && { echo "  PASS  诊断说明是重复签发"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  诊断未说明重复签发"; FAIL=$((FAIL+1)); }
+grep -q '\-\-force' <<< "$OUT" \
+  && { echo "  PASS  诊断给出 --force 手工修法"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  诊断未给修法"; FAIL=$((FAIL+1)); }
+
+echo
+echo "[13] 脚本必须只在 install 时复制，不在删节点时删 acme 证书"
+nchk "del_node 不调用 acme --remove" bash -c "awk '/^del_node\\(\\)/,/^}/' '$SRC' | grep -q 'ACME_SH\" --remove'"
+nchk "uninstall_all 不调用 acme --remove" bash -c "awk '/^uninstall_all\\(\\)/,/^}/' '$SRC' | grep -q 'ACME_SH\" --remove'"
+chk  "issue_cert 识别已存在证书" bash -c "grep -q 'acme_log_already_issued' '$SRC'"
+chk  "issue_cert 不再依赖 --info 键名" bash -c "! awk '/^issue_cert\\(\\)/,/^}/' '$SRC' | grep -q 'Le_RealCertPath'"
+
+
 echo "==================== 结果: PASS=$PASS  FAIL=$FAIL ===================="
 [[ $FAIL -eq 0 ]] || exit 1
