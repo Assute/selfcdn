@@ -102,6 +102,19 @@ firewall-cmd --permanent --add-service={http,https} && firewall-cmd --reload
    0) 退出
 ```
 
+菜单 `2` 的列表带证书状态，直接看剩余天数：
+
+```
+#    标识       域名                           回源                     缓存 证书剩余
+1    edge1      static.example.com             1.2.3.4:8080               on    89 天
+2    edge2      img.example.com                5.6.7.8:80                 off   7 天 需续期
+3    edge3      test.example.com               1.2.3.4:80                 off   已过期 3 天
+4    edge4      new.example.com                1.2.3.4:80                 off   未签发
+```
+
+四种状态：`N 天`（正常）· `N 天 需续期`（≤30 天）· `已过期 N 天` · `未签发`。
+还剩 0 天当天显示 `今日到期`。
+
 ---
 
 ## 添加节点的完整流程

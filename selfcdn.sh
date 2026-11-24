@@ -4,7 +4,7 @@
 # target: Debian/Ubuntu · RHEL/CentOS/Rocky/Alma · 需 root
 set -uo pipefail
 
-VERSION="1.1.3"
+VERSION="1.1.4"
 
 BASE=/etc/selfcdn
 NODES_DIR=$BASE/nodes
@@ -875,14 +875,33 @@ acme_cert_file() { echo "$ACME_HOME/$1_ecc/$1.cer"; }
 acme_has_cert()  { [[ -f $(acme_cert_file "$1") ]]; }
 
 # 证书剩余天数；拿不到返回 -1
+# 第二个参数可注入"当前时间"（epoch 秒），仅用于测试；正常运行省略。
 cert_days_left() {
-  local f=$1 end
-  [[ -f $f ]] || { echo -1; return; }
+  local f=$1 now=${2:-} end e
+  [[ -f $f ]] || return 0
+  [[ -n $now ]] || now=$(date +%s)
   end=$(openssl x509 -enddate -noout -in "$f" 2>/dev/null | cut -d= -f2)
-  [[ -n $end ]] || { echo -1; return; }
-  local e
-  e=$(date -d "$end" +%s 2>/dev/null) || { echo -1; return; }
-  echo $(( ( e - $(date +%s) ) / 86400 ))
+  [[ -n $end ]] || return 0
+  e=$(date -d "$end" +%s 2>/dev/null) || return 0
+  echo $(( ( e - now ) / 86400 ))
+}
+
+# 列表里显示的证书状态文案（单独抽出来，方便离线测各分支）
+cert_state_text() {
+  local d
+  [[ -f $1 ]] || { echo "未签发"; return; }
+  d=$(cert_days_left "$1" "${2:-}")
+  if [[ -z $d ]]; then
+    echo "无法读取"
+  elif (( d < 0 )); then
+    echo "已过期 $((-d)) 天"
+  elif (( d == 0 )); then
+    echo "今日到期"
+  elif (( d <= 30 )); then
+    echo "${d} 天 需续期"
+  else
+    echo "${d} 天"
+  fi
 }
 
 issue_cert() {
@@ -901,7 +920,7 @@ issue_cert() {
 
     # 本地副本缺失（如节点被删后重建、换了标识）→ 只做安装，一次网络请求都不用发
     if [[ ! -f $local_cert || ! -f $local_key ]]; then
-      info "acme.sh 已有 $DOMAIN 的证书（剩余 ${days} 天），直接装到节点目录，不重新签发"
+      info "acme.sh 已有 $DOMAIN 的证书（剩余 ${days:-?} 天），直接装到节点目录，不重新签发"
       install_cert "$name" || return 1
       ok "证书已就位: $CERT_DIR/$name"
       return 0
@@ -910,11 +929,11 @@ issue_cert() {
     # 本地也有效且不临近到期 → 不动
     local ldays
     ldays=$(cert_days_left "$local_cert")
-    if (( ldays > 30 )); then
+    if [[ -n $ldays ]] && (( ldays > 30 )); then
       ok "证书仍有效（剩余 $ldays 天），无需签发"
       return 0
     fi
-    info "证书剩余 $ldays 天，执行续期"
+    info "证书剩余 ${ldays:-?} 天，执行续期"
     mode=renew
   fi
 
@@ -1088,7 +1107,7 @@ list_nodes() {
   names=$(list_node_names)
   if [[ -z $names ]]; then echo; echo "（暂无节点）"; pause; return; fi
   echo
-  printf "%-4s %-12s %-32s %-26s %-6s %s\n" "#" "标识" "域名" "回源" "缓存" "证书到期"
+  printf "%-4s %-12s %-32s %-26s %-6s %s\n" "#" "标识" "域名" "回源" "缓存" "证书剩余"
   printf '%s\n' "--------------------------------------------------------------------------------------------------------"
   while read -r n; do
     [[ -z $n ]] && continue
@@ -1099,8 +1118,7 @@ list_nodes() {
     local cert="未签发"
     # 证书必须与当前域名匹配，换域名后旧证书不算有效
     if [[ -f "$CERT_DIR/$n/fullchain.cer" && -f "$CERT_DIR/$n/$DOMAIN.key" ]]; then
-      local e; e=$(openssl x509 -enddate -noout -in "$CERT_DIR/$n/fullchain.cer" 2>/dev/null | cut -d= -f2)
-      cert=${e:-未知}
+      cert=$(cert_state_text "$CERT_DIR/$n/fullchain.cer")
     fi
     printf "%-4s %-12s %-32s %-26s %-6s %s\n" "$idx" "$n" "$DOMAIN" "$UPSTREAMS" "$ce" "$cert"
   done <<< "$names"
@@ -1196,6 +1214,7 @@ show_node() {
   if [[ -f "$CERT_DIR/$n/fullchain.cer" && -f "$CERT_DIR/$n/$DOMAIN.key" ]]; then
     echo; echo "===== 证书信息 ====="
     openssl x509 -noout -subject -issuer -dates -in "$CERT_DIR/$n/fullchain.cer" 2>/dev/null | sed 's/^/  /'
+    echo "  剩余: $(cert_state_text "$CERT_DIR/$n/fullchain.cer")"
   elif [[ -f "$CERT_DIR/$n/fullchain.cer" ]]; then
     echo; echo "===== 证书信息（与当前域名不匹配，需重新签发）====="
     openssl x509 -noout -subject -dates -in "$CERT_DIR/$n/fullchain.cer" 2>/dev/null | sed 's/^/  /'

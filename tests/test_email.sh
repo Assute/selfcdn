@@ -163,7 +163,7 @@ chk  "证书路径按 <domain>_ecc 构造"      test "$(acme_cert_file demo.exam
 D1=$(cert_days_left "$SELF_SIGNED")
 echo "    自签 90 天证书探测剩余天数: $D1"
 chk  "剩余天数为正数（80-91）"           test "$D1" -ge 80 -a "$D1" -le 91
-chk  "不存在文件返回 -1"                test "$(cert_days_left "$TMP/nope.cer")" -eq -1
+chk  "不存在文件返回空"                test -z "$(cert_days_left "$TMP/nope.cer")"
 
 # 过期证书应给出 <=0
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
@@ -209,6 +209,81 @@ nchk "del_node 不调用 acme --remove" bash -c "awk '/^del_node\\(\\)/,/^}/' '$
 nchk "uninstall_all 不调用 acme --remove" bash -c "awk '/^uninstall_all\\(\\)/,/^}/' '$SRC' | grep -q 'ACME_SH\" --remove'"
 chk  "issue_cert 识别已存在证书" bash -c "grep -q 'acme_log_already_issued' '$SRC'"
 chk  "issue_cert 不再依赖 --info 键名" bash -c "! awk '/^issue_cert\\(\\)/,/^}/' '$SRC' | grep -q 'Le_RealCertPath'"
+
+
+echo
+echo "[14] 证书剩余天数文案（四态）"
+mk_cert() {  # mk_cert <out> <days>
+  openssl req -x509 -newkey rsa:2048 -nodes -days "$2" \
+    -keyout "$1.key" -out "$1" -subj "$(subj_cn list.test)" >/dev/null 2>&1
+}
+mk_cert "$TMP/ok.cer" 90
+mk_cert "$TMP/soon.cer" 10
+mk_cert "$TMP/today.cer" 0 2>/dev/null || true
+
+TXT_OK=$(cert_state_text "$TMP/ok.cer")
+TXT_SOON=$(cert_state_text "$TMP/soon.cer")
+TXT_NONE=$(cert_state_text "$TMP/does-not-exist.cer")
+
+echo "    90 天  -> [$TXT_OK]"
+echo "    10 天  -> [$TXT_SOON]"
+echo "    无文件 -> [$TXT_NONE]"
+
+chk  "90 天显示纯天数"        bash -c "printf '%s' '$TXT_OK' | grep -qE '^(89|90) 天$'"
+chk  "10 天标注需续期"        bash -c "printf '%s' '$TXT_SOON' | grep -qE '^(9|10) 天 需续期$'"
+chk  "无证书显示未签发"        test "$TXT_NONE" = "未签发"
+if [[ -f $TMP/today.cer ]]; then
+  TXT_TODAY=$(cert_state_text "$TMP/today.cer")
+  echo "    0 天   -> [$TXT_TODAY]"
+  chk "0 天期显示今日到期"      test "$TXT_TODAY" = "今日到期"
+fi
+
+# 过期分支：给函数注入"未来时间"，避免改系统时钟 / 伪造 date（bash 会 hash 路径）
+FUTURE=$(( $(date +%s) + 130*86400 ))
+TXT_OLD=$(cert_state_text "$TMP/ok.cer" "$FUTURE")
+echo "    注入未来 130 天 -> [$TXT_OLD]"
+chk  "过期显示「已过期 N 天」"  bash -c "printf '%s' '$TXT_OLD' | grep -qE '^已过期 [0-9]+ 天$'"
+chk  "过期天数约为 40"          bash -c "printf '%s' '$TXT_OLD' | grep -qE '^已过期 (3[5-9]|4[0-5]) 天$'"
+# 边界：正好到期当天
+AT_ZERO=$(cert_days_left "$TMP/ok.cer" "$(( $(date -d "$(openssl x509 -enddate -noout -in "$TMP/ok.cer" | cut -d= -f2)" +%s) ))" )
+chk  "到期当天算 0 天"          test "$AT_ZERO" -eq 0
+TXT_TODAY2=$(cert_state_text "$TMP/ok.cer" "$(( $(date -d "$(openssl x509 -enddate -noout -in "$TMP/ok.cer" | cut -d= -f2)" +%s) ))" )
+echo "    到期当天 -> [$TXT_TODAY2]"
+chk  "到期当天文案为今日到期"    test "$TXT_TODAY2" = "今日到期"
+
+echo
+echo "[15] 节点列表格式"
+NODES_DIR=$TMP/lnodes
+CERT_DIR=$TMP/lcerts
+mkdir -p "$NODES_DIR" "$CERT_DIR/ok" "$CERT_DIR/none"
+mk_cert "$CERT_DIR/ok/fullchain.cer" 90
+cp "$CERT_DIR/ok/fullchain.cer.key" "$CERT_DIR/ok/a.test.key"
+
+mk_node() {
+  printf 'NAME=%s\nDOMAIN=%s\nUPSTREAMS=%s\nUPSTREAM_SCHEME=http\nPROXY_HOST=\$host\nCACHE_ENABLE=0\nCACHE_TTL=24h\nCACHE_SIZE=1g\nCACHE_MEM=10m\nCLIENT_MAX_BODY=1m\nTLS_MODE=acme\n' \
+    "$1" "$2" "1.2.3.4:80" > "$NODES_DIR/$1.conf"
+}
+mk_node ok   a.test
+mk_node none d.test
+
+OUT=$(list_nodes < /dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+echo "  ---- 列表输出 ----"
+printf '%s\n' "$OUT" | grep -vE '^$' | sed 's/^/    /'
+
+grep -q '证书剩余' <<< "$OUT" \
+  && { echo "  PASS  表头为「证书剩余」"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  表头未改"; FAIL=$((FAIL+1)); }
+nchk "不再出现「证书到期」"     grep -q '证书到期' <<< "$OUT"
+nchk "不再出现 GMT 绝对时间"    grep -q 'GMT' <<< "$OUT"
+grep -qE '(89|90) 天' <<< "$OUT" \
+  && { echo "  PASS  有证书节点显示天数"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  未显示天数"; FAIL=$((FAIL+1)); }
+grep -q '未签发' <<< "$OUT" \
+  && { echo "  PASS  无证书节点显示未签发"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  无证书节点异常"; FAIL=$((FAIL+1)); }
+
+NODES_DIR=$TMP/n
+CERT_DIR=$TMP/c
 
 
 echo "==================== 结果: PASS=$PASS  FAIL=$FAIL ===================="
