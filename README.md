@@ -166,6 +166,15 @@ acme.sh 装的时候已经写进 cron（每天跑），正常不用管。手动�
 **注意**：清缓存是直接删磁盘文件。Nginx 打开中的文件描述符不受影响，
 但极小概率下正在读取的请求会拿到不完整内容。介意的话在低峰期做。
 
+### reload 生效有个窗口
+
+`systemctl reload nginx` 是优雅重载：旧 worker 会把手上的连接处理完才退出。
+这段时间里新连接有可能被旧 worker 接走，表现为「刚加的节点访问不到」。
+
+脚本加的自检会带 `Host` 头打 `127.0.0.1` 最多重试 10 秒，并且**只认本节点自己的标记**
+（HTTPS 模式认 301→https，引导模式认 `X-CDN-Node` 头），不会因为 Debian 默认站点回了
+200/404 就误报成功。看到自检提示没通，隔几秒用菜单 `7` 重载一次即可。
+
 ---
 
 ## 文件布局
@@ -193,29 +202,68 @@ acme.sh 装的时候已经写进 cron（每天跑），正常不用管。手动�
 
 ## 已验证 / 未验证
 
-**已离线验证**（`tests/test_render.sh` 37 项 + `tests/test_apt_repair.sh` 24 项 + `tests/lint.sh`）：
+### 真机实测（Debian 11 bullseye · nginx 1.18.0 · 2 核 978M）
 
-配置生成结构、占位符全替换、HTTP 引导期不下发 HSTS、HTTPS 期证书路径、
-连字符节点名转下划线做 Nginx ID、缓存关闭时不残留 `proxy_cache`、
-节点登记文件 `%q` 往返（含 `$host` 这类 Nginx 变量的转义保全）、
-IPv6 关闭时不生成 `[::]` 监听、无残缺 `listen` 行、
-`reload` 前强制 `nginx_test`、`rm -rf` 无未加引号变量、`${VAR:?}` 空值保护。
+以下是在一台真实 Debian 11 机器上跑出来的结果，不是纸面推演：
 
-Debian 源修复两级阶梯用真实坏源样本复刻验证：主源保留不误切归档、旧 `*/updates` 与
-`backports` 剔除、security 源路径与组件补正、备份生成且备份内容保持原样、二次执行幂等、
-自建镜像与健康官方源不被误伤、`sources.list.d` 一并处理。
+| 项 | 结果 |
+|---|---|
+| apt 源自动修复（4 级阶梯） | ✅ 索引在、pool 404 的坏源自动爬到归档站后装成功 |
+| nginx 安装 | ✅ 1.18.0 装上并 active |
+| nginx -t | ✅ 每步都过 |
+| 加节点 → HTTP 引导模式 | ✅ 生成配置、reload、自检命中 |
+| 代理缓存 | ✅ MISS → HIT → HIT，缓存文件落盘 |
+| 缓存键含 Host | ✅ 未匹配的 Host 落默认站点，不串缓存 |
+| 双节点隔离 | ✅ 各自 zone / 缓存目录 / `X-CDN-Node`，清一个另一个仍 HIT |
+| 清缓存 | ✅ 清后回 MISS |
+| 删节点 | ✅ vhost / zone / 缓存目录 / 证书 / 日志全清，nginx -t 仍 OK |
+| HTTPS（自签证书顶替） | ✅ 443 挂牌、80→301、TLS1.2 与 TLS1.3 均 200 |
+| HSTS / 安全头 | ✅ HTTPS 下发，HTTP 引导期不下发 |
+| 已有节点时重复启动脚本 | ✅ 不再破坏配置（见下方踩坑记录） |
+| stdin EOF（管道 / Ctrl-D） | ✅ 立即退出，不空转 |
 
-**未在线验证**：证书签发全链路、真实 Nginx 下的缓存命中、`apt` 实际安装过程。
-本机没有任何 Linux 运行时（WSL 无发行版、无 Docker），`nginx -t` 只在目标机执行，
-脚本每次 reload 前都强制过这一关，不过即中止。
+### 真机实测挖出并修掉的 5 个 bug
 
-**所以第一次请拿测试域名跑**，别直接上生产域名。
+这些都是离线测试看不出来、只有真跑才会暴露的：
+
+1. **启动即冲掉缓存区** —— `main()` 只写 `map` 不写 `proxy_cache_path`，
+   导致每次启动脚本就把已有节点的 cache zone 抹掉，`nginx -t` 报
+   `proxy_cache zone ... is unknown`。此时若 systemd 重启 nginx，**直接起不来**。
+   修法：合并成单一 `render_global_conf()`，启动与增删节点都走它。
+2. **apt 只在 update 失败时升档** —— 实况是索引正常、pool 里的 `.deb` 已 404，
+   `install` 阶段才炸。修法：新增「install 下载失败也升档」，并区分源问题和安装冲突。
+3. **`add_header` 被拼到同一行** —— 命令替换吃掉末尾换行，多条指令挤在一行、
+   `}` 粘在行尾。nginx 能解析但极脆。修法：显式补 `$'\n'`。
+4. **自检误报成功** —— 只看状态码，Debian 默认站点回的 200 被当成"通了"。
+   修法：改成认本节点标记头（或 301→https），并把重试拉到 10 秒兜住 reload 窗口。
+5. **stdin EOF 死循环** —— `read` 返回非 0 时 `choice` 为空 → 无效分支 →
+   `pause` 也立即返回 → 空转。实测烧 28% CPU 十分钟不停。修法：判 `read` 返回值并退出。
+
+### 离线测试
+
+`tests/test_render.sh` 50 项 · `tests/test_apt_repair.sh` 43 项 · `tests/test_eof.sh` 9 项 · `tests/lint.sh`
+
+覆盖：配置结构、占位符全替换、HTTP/HTTPS 两种模式的安全头差异、证书路径、
+连字符节点名转下划线、缓存关闭时不残留 `proxy_cache`、节点登记 `%q` 往返
+（含 `$host` 变量转义）、IPv6 关闭时不生成 `[::]`、指令逐行、zone 不丢不重、
+apt 四级阶梯各分支、EOF 与非法输入退出。
+
+### 未验证
+
+- **真实 Let's Encrypt 签发全链路**：需要域名 A 记录指向该机，测试环境没有域名。
+  HTTPS 配置分支已用自签证书在真 nginx 上验过，但 `acme.sh --issue` 走到 LE 的
+  这一段没跑（会注册真实 ACME 账户）。
+- **高并发 / 大文件 / 长连接**压力表现。
+- Ubuntu、RHEL 系发行版（只在 Debian 11 上跑过）。
+
+**第一次请拿测试域名跑**，别直接上生产域名。
 
 自测命令：
 
 ```bash
 bash tests/test_render.sh      # 配置离线渲染，不碰系统
 bash tests/test_apt_repair.sh  # Debian 源修复逻辑，不调 apt
+bash tests/test_eof.sh         # 菜单 EOF / 非法输入行为
 bash tests/lint.sh             # 语法 + 反模式扫描 + shellcheck（若装）
 ```
 
@@ -233,15 +281,26 @@ E: The repository 'http://deb.debian.org/debian bullseye-backports Release' does
 ```
 
 原因是 Debian 11 及更早的 `security.debian.org <codename>/updates` 这种旧写法早已废弃，
-`*-backports` 在发行版进入 LTS/归档后也会被撤。脚本现在会自动处理，走两级阶梯：
+`*-backports` 在发行版进入 LTS/归档后也会被撤。
 
-1. **最小修复**：删掉过时的 `/<suite>/updates` 与 `*-backports` 行，把 security 源补正为
-   `http://security.debian.org/debian-security <codename>-security`。
-   **主源仍是 deb.debian.org**，不会把还在维护的发行版冻到归档站。
-2. **归档兜底**：只有第一级之后仍失败（发行版彻底 EOL、主源也撤了）才整体切
-   `archive.debian.org`，并写 `Acquire::Check-Valid-Until "false";` 让它接受过期 Release。
+**更坑的是第二种情况**：`apt-get update` 能过，但 `apt-get install` 报一片 404 ——
+索引还在、pool 里的 `.deb` 已被清走。真机实测就是这个状态：
 
-两级都会先备份成 `*.selfcdn.bak`。手动触发：
+```
+E: Failed to fetch http://security.debian.org/debian-security/pool/updates/main/n/nginx/nginx-common_1.18.0-6.1+deb11u8_all.deb  404  Not Found
+E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?
+```
+
+所以脚本走**四级阶梯**，任一级成功即停，且 `update` 失败和 `install` 下载失败都会触发升档：
+
+| 级 | 动作 | 适用 |
+|---|---|---|
+| 1 | 直接装 | 源正常 |
+| 2 | 最小修源：剔 `/<suite>/updates` 与 `*-backports`，security 补正为 `security.debian.org/debian-security <codename>-security` | 旧写法失效，主源还好 |
+| 3 | 只把 security 挪到 `archive.debian.org/debian-security`，**主源继续用快镜像** | 索引在但 security pool 已空 ← 真机实测的这个 |
+| 4 | 整体切 `archive.debian.org` + `Acquire::Check-Valid-Until "false"` | 发行版彻底 EOL，主源也没了 |
+
+前两级备份成 `*.selfcdn.bak`，第三级另存 `*.selfcdn.bak2`。手动触发：
 
 ```bash
 selfcdn --fix-apt
@@ -255,7 +314,12 @@ rm -f /etc/apt/apt.conf.d/99selfcdn-archive
 apt-get update
 ```
 
-codename 从 `/etc/os-release` 取，取不到就从现有源的 suite 反推，不硬编码。
+如果还不行，把 `/etc/apt/sources.list.selfcdn.bak2` 也还原回去。
+
+codename 从 `/etc/os-release` 取，取不到就从现有源的 suite 反推，**不硬编码**。
+第三方源不会被误伤（只有 `deb.debian.org` / `security.debian.org` 会被改写）。
+组件列表沿用你主源那一行，不会擅自打开 `non-free`；原文带 `deb-src` 的，security 也补
+`deb-src` 保持对称，`apt-get source` 不断。
 
 ---
 

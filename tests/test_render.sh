@@ -52,7 +52,7 @@ PROXY_HOST='$host'
 CACHE_ENABLE=1; CACHE_TTL=24h; CACHE_SIZE=5g; CACHE_MEM=100m
 CLIENT_MAX_BODY=100m; TLS_MODE=acme
 save_node edge1
-rebuild_cache_zones
+render_global_conf
 gen_node_conf edge1 >/dev/null
 CONF=$NGINX_CONF_D/selfcdn-edge1.conf
 
@@ -99,6 +99,18 @@ else
 fi
 chk "无残缺 listen 行"            "^ *listen *;? *\$"             "$CONF" neg
 
+# 每条指令必须独占一行：命令替换吃掉换行会把 add_header 挤在一起、把 } 粘在行尾
+echo
+echo "  格式检查（线上实测踩过：add_header 被拼到同一行）"
+chk "无单行多指令（add_header 拼接）" "^.*add_header.*add_header"     "$CONF" neg
+chk "无指令紧跟闭合括号"              "add_header.*;[[:space:]]+\}"    "$CONF" neg
+chk "无 proxy_ 指令紧跟闭合括号"      "proxy_[a-z_]+ .*;[[:space:]]+\}" "$CONF" neg
+chk "无单行多 proxy_cache"           "^.*proxy_cache .*proxy_cache "  "$CONF" neg
+# 每条 add_header 都要真的换行结尾
+badhdr=$(awk '/add_header/{ if ($0 !~ /;[[:space:]]*$/) print NR": "$0 }' "$CONF")
+if [[ -z $badhdr ]]; then echo "  PASS  add_header 均以 ; 换行结尾"; PASS=$((PASS+1))
+else echo "  FAIL  add_header 行尾异常: $badhdr"; FAIL=$((FAIL+1)); fi
+
 # --- 用例 C: 缓存关闭 + 连字符节点名
 echo
 echo "[C] edge-two 缓存关闭、连字符标识"
@@ -109,7 +121,7 @@ PROXY_HOST=origin.example.com
 CACHE_ENABLE=0; CACHE_TTL=1h; CACHE_SIZE=1g; CACHE_MEM=50m
 CLIENT_MAX_BODY=10m; TLS_MODE=acme
 save_node edge-two
-rebuild_cache_zones
+render_global_conf
 rm -f "$CERT_DIR/edge-two" -r
 gen_node_conf edge-two >/dev/null
 C2=$NGINX_CONF_D/selfcdn-edge-two.conf
@@ -137,6 +149,34 @@ echo "    NAME=$NAME DOMAIN=$DOMAIN UPSTREAMS=$UPSTREAMS SCHEME=$UPSTREAM_SCHEME
   || { echo "  FAIL  PROXY_HOST 往返: [$PROXY_HOST]"; FAIL=$((FAIL+1)); }
 
 echo
+
+# --- 用例 E: 全局片段重建（线上踩过：启动即冲掉 cache zone → nginx -t 挂）
+echo
+# --- 用例 E: 全局片段重建（线上踩过：启动即冲掉 cache zone → nginx -t 挂）
+echo
+echo "[E] 全局片段重建不丢 zone、不重复"
+assert() {  # assert "描述" 命令...
+  local d=$1; shift
+  if "$@" >/dev/null 2>&1; then echo "  PASS  $d"; PASS=$((PASS+1))
+  else echo "  FAIL  $d"; FAIL=$((FAIL+1)); fi
+}
+render_global_conf
+c1=$(grep -c 'proxy_cache_path' "$GLOBAL_CONF" 2>/dev/null || true)
+render_global_conf
+c2=$(grep -c 'proxy_cache_path' "$GLOBAL_CONF" 2>/dev/null || true)
+c1=${c1:-0}; c2=${c2:-0}
+assert "重复重建 zone 数稳定"           test "$c1" = "$c2"
+assert "缓存开启节点有且仅有 1 个 zone"  test "$c2" -eq 1
+assert "缓存关闭节点不产生 zone"         bash -c "! grep -q 'keys_zone=cdn_edge_two' '$GLOBAL_CONF'"
+assert "map 仍在（未被 zone 覆盖）"      grep -q 'connection_upgrade' "$GLOBAL_CONF"
+assert "upstream map 存在"              grep -q 'default upgrade' "$GLOBAL_CONF"
+n_def=$(grep -vE '^[[:space:]]*#' "$SRC" | grep -c 'proxy_cache_path' 2>/dev/null || true)
+assert "脚本里只有一处 zone 生成点"      test "${n_def:-0}" -eq 1
+# 启动路径（main）必须走同一个渲染函数，否则又会把 zone 冲掉
+assert "main 用 render_global_conf"     bash -c "awk '/^main\\(\\)/,/^}/' '$SRC' | grep -q 'render_global_conf'"
+assert "无用旧函数 write_global_conf 分叉" bash -c "! awk '/^write_global_conf\\(\\)/,/^}/' '$SRC' | grep -q 'proxy_cache_path'"
+
+
 echo "==================== 结果: PASS=$PASS  FAIL=$FAIL ===================="
 rm -rf "$TMP"
 [[ $FAIL -eq 0 ]] || exit 1

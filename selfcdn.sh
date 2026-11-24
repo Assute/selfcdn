@@ -4,7 +4,7 @@
 # target: Debian/Ubuntu · RHEL/CentOS/Rocky/Alma · 需 root
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 BASE=/etc/selfcdn
 NODES_DIR=$BASE/nodes
@@ -22,7 +22,8 @@ APT_SOURCES=${APT_SOURCES:-/etc/apt/sources.list}
 APT_SOURCES_D=${APT_SOURCES_D:-/etc/apt/sources.list.d}
 APT_CONF_D=${APT_CONF_D:-/etc/apt/apt.conf.d}
 
-R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[36m'; D='\033[2m'; N='\033[0m'
+# 颜色用真实 ESC（$'..'）。printf 会解释 \033，但 cat <<HEREDOC 不会 —— 统一用真字符
+R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[36m'; D=$'\033[2m'; N=$'\033[0m'
 
 info() { printf "${B}[*]${N} %s\n" "$*"; }
 ok()   { printf "${G}[+]${N} %s\n" "$*"; }
@@ -87,8 +88,22 @@ apt_fix_repos_minimal() {
   while read -r f; do
     [[ -n $f ]] || continue
     grep -qE 'deb\.debian\.org|security\.debian\.org' "$f" 2>/dev/null || continue
-    # 只认真正的坏行：过时的 /<suite>/updates、*-backports、security 缺 /debian-security 路径
-    grep -qE '/[A-Za-z]+/updates([[:space:]]|$)|-backports|security\.debian\.org([[:space:]]|$)' "$f" 2>/dev/null || continue
+    # 只认真正的坏行（按字段判定，URL 带不带尾斜杠都覆盖）：
+    #   suite = *-backports        → 归档后被撤
+    #   suite = */updates          → 旧写法，2021 年起废弃
+    #   security.debian.org 且缺 /debian-security 路径
+    local need=0
+    awk '
+      /^[[:space:]]*#/ { next }
+      $1 ~ /^deb(-src)?$/ {
+        s = $3
+        if (s ~ /-backports$/) { exit 2 }
+        if (s ~ /\/updates$/)  { exit 2 }
+        if ($2 ~ /security\.debian\.org/ && $2 !~ /debian-security/) { exit 2 }
+      }
+    ' "$f"
+    need=$?
+    [[ $need -eq 2 ]] || continue
 
     cp -n "$f" "$f.selfcdn.bak" 2>/dev/null || true
 
@@ -98,24 +113,78 @@ apt_fix_repos_minimal() {
     ' "$f")
     [[ -z $comps ]] && comps="main"
 
+    # 原文件若带 deb-src，security 源也补 deb-src，保持对称（不然 apt-get source 会断）
+    local hassrc=0
+    grep -qE '^[[:space:]]*deb-src[[:space:]]' "$f" && hassrc=1
+
     tmp=$(mktemp)
-    awk '
-      /^[[:space:]]*#/           { print; next }
-      /security\.debian\.org/    { next }
-      /-backports/               { next }
-      /\/[A-Za-z]+\/updates([[:space:]]|$)/ { next }
+    awk -v cn="$codename" -v comps="$comps" -v hassrc="$hassrc" '
+      BEGIN { sec_done = 0; had_sec = 0 }
+
+      /^[[:space:]]*#/ { print; next }
+
+      $1 ~ /^deb(-src)?$/ {
+        s = $3
+        # security 源优先判定并就地替换：它的 suite 常是 <codename>/updates，
+        # 若先命中下面的 /updates$ 规则就会被直接丢掉、替换行落到文件末尾
+        if ($2 ~ /security\.debian\.org/) {
+          had_sec = 1
+          if (!sec_done) {
+            printf "deb     http://security.debian.org/debian-security %s-security %s\n", cn, comps
+            if (hassrc == 1)
+              printf "deb-src http://security.debian.org/debian-security %s-security %s\n", cn, comps
+            sec_done = 1
+          }
+          next
+        }
+        # 归档后被撤的 backports
+        if (s ~ /-backports$/) next
+        # 过时的 <suite>/updates
+        if (s ~ /\/updates$/) next
+      }
+
       { print }
+
+      END {
+        # 原文件本来没有 security 源，补一条到末尾
+        if (had_sec == 0) {
+          printf "deb     http://security.debian.org/debian-security %s-security %s\n", cn, comps
+          if (hassrc == 1)
+            printf "deb-src http://security.debian.org/debian-security %s-security %s\n", cn, comps
+        }
+      }
     ' "$f" > "$tmp"
-    # 已有正确的 security 源就不再追加，避免 "configured multiple times"
-    if ! grep -q 'security\.debian\.org/debian-security' "$tmp" 2>/dev/null; then
-      printf 'deb http://security.debian.org/debian-security %s-security %s\n' "$codename" "$comps" >> "$tmp"
-    fi
     mv "$tmp" "$f"
     changed=1
     info "已剔除废弃行并补正 security 源: $f（备份 *.selfcdn.bak）"
   done < <(apt_sources_files)
 
   (( changed )) && { ok "Debian 源已最小化修复"; return 0; }
+  return 1
+}
+
+# 第三级：只把 security 源挪到归档站，主源继续用快镜像。
+# 线上实况：bullseye-security 索引还在，但 pool 里的 .deb 已被清走，
+# install 时报 "Failed to fetch ... 404"，此时主源无需改动。
+apt_move_security_to_archive() {
+  local changed=0 f
+  while read -r f; do
+    [[ -n $f ]] || continue
+    grep -q 'security\.debian\.org/debian-security' "$f" 2>/dev/null || continue
+    cp -n "$f" "$f.selfcdn.bak2" 2>/dev/null || true
+    sed -i \
+      -e 's|https\?://security\.debian\.org/debian-security|https://archive.debian.org/debian-security|g' \
+      "$f"
+    changed=1
+    info "security 源已改指归档站: $f（备份 *.selfcdn.bak2）"
+  done < <(apt_sources_files)
+
+  if (( changed )); then
+    mkdir -p "$APT_CONF_D" 2>/dev/null || true
+    printf 'Acquire::Check-Valid-Until "false";\n' > "$APT_CONF_D/99selfcdn-archive" 2>/dev/null || true
+    ok "security 走 archive.debian.org，主源保持不动"
+    return 0
+  fi
   return 1
 }
 
@@ -153,33 +222,82 @@ apt_refresh() {
   DEBIAN_FRONTEND=noninteractive apt-get update -qq
 }
 
-# 阶梯：正常更新 → 最小修复 → 归档兜底。任何一级成功即停。
+APT_LOG=/tmp/selfcdn-apt-install.log
+
+apt_install_quiet() {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" > "$APT_LOG" 2>&1
+}
+
+# 区分"源/下载问题"和"真·安装冲突"，后者不该去改源
+apt_log_is_fetch_failure() {
+  grep -qE 'Failed to fetch|Unable to fetch|does not have a Release file|404  *Not Found|Hash Sum mismatch|Some index files failed to download' "$APT_LOG" 2>/dev/null
+}
+
+apt_log_tail() {
+  tail -20 "$APT_LOG" 2>/dev/null | sed 's/^/    /' >&2
+}
+
+# 阶梯：正常更新 → 最小修源 → security 转归档 → 整体归档。任何一级成功即停。
 apt_repair_ladder() {
-  local tried_min=0
   if apt_refresh; then return 0; fi
 
   warn "apt 索引更新失败，判断为源失效（发行版过旧 / 过时仓库行）"
   if apt_fix_repos_minimal; then
-    tried_min=1
     if apt_refresh; then return 0; fi
-    warn "最小修复后仍失败，主源可能也已归档"
+    warn "最小修源后仍失败"
   else
     warn "未发现可最小修复的坏行"
+  fi
+
+  if apt_move_security_to_archive; then
+    if apt_refresh; then return 0; fi
+    warn "security 转归档后仍失败"
   fi
 
   if apt_fix_eol_repos; then
     if apt_refresh; then return 0; fi
     warn "切归档源后仍更新失败，检查网络 / DNS / 代理"
   fi
-  (( tried_min )) || warn "未能自动修复，请手工检查 /etc/apt/sources.list"
+  warn "未能自动修复，请手工检查 /etc/apt/sources.list"
   return 1
 }
 
 pkg_install() {
   case $PKG in
     apt)
-      apt_repair_ladder || warn "索引更新未成功，仍尝试安装（可能命中本地缓存）"
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+      # 阶梯式：直装 → 最小修源 → security 挪归档 → 整体归档
+      # 关键：install 阶段的下载失败（.deb 404）同样要升档，不能只看 update
+      apt_refresh >/dev/null 2>&1 || true
+
+      apt_install_quiet "$@" && return 0
+
+      if ! apt_log_is_fetch_failure; then
+        err "apt 安装失败（非软件源问题）:"
+        apt_log_tail
+        return 1
+      fi
+      warn "包下载失败：索引里引用的 .deb 已不在镜像上"
+
+      if apt_fix_repos_minimal; then
+        apt_refresh >/dev/null 2>&1 || true
+        apt_install_quiet "$@" && { ok "最小修源后安装成功"; return 0; }
+        apt_log_is_fetch_failure || { err "安装失败:"; apt_log_tail; return 1; }
+      fi
+
+      if apt_move_security_to_archive; then
+        apt_refresh >/dev/null 2>&1 || true
+        apt_install_quiet "$@" && { ok "security 转归档后安装成功"; return 0; }
+        apt_log_is_fetch_failure || { err "安装失败:"; apt_log_tail; return 1; }
+      fi
+
+      if apt_fix_eol_repos; then
+        apt_refresh >/dev/null 2>&1 || true
+        apt_install_quiet "$@" && { ok "整体切归档后安装成功"; return 0; }
+      fi
+
+      err "依赖安装仍失败，最后错误:"
+      apt_log_tail
+      return 1
       ;;
     dnf) dnf install -y -q "$@" ;;
     yum) yum install -y -q "$@" ;;
@@ -198,9 +316,13 @@ install_deps() {
     if ! pkg_install "${miss[@]}"; then
       err "依赖安装失败: ${miss[*]}"
       if [[ $PKG == apt ]]; then
-        echo "    该机可能是已 EOL 的 Debian 版本。手工修复：" >&2
+        echo "    该机可能是已 EOL 的 Debian 版本（索引在、但 .deb 已被移走）。" >&2
+        echo "    手工修复：" >&2
         echo "      cp /etc/apt/sources.list /etc/apt/sources.list.bak" >&2
-        echo "      sed -i 's|deb.debian.org/debian|archive.debian.org/debian|g; s|security.debian.org|archive.debian.org|g' /etc/apt/sources.list" >&2
+        echo "      # 方案A: security 走归档，主源保持（推荐，最快）" >&2
+        echo "      sed -i 's|security.debian.org/debian-security|archive.debian.org/debian-security|g' /etc/apt/sources.list" >&2
+        echo "      # 方案B: 全部走归档" >&2
+        echo "      sed -i 's|deb.debian.org/debian|archive.debian.org/debian|g' /etc/apt/sources.list" >&2
         echo "      echo 'Acquire::Check-Valid-Until \"false\";' > /etc/apt/apt.conf.d/99archive" >&2
         echo "      apt-get update && apt-get install -y ${miss[*]}" >&2
         echo "    或直接: selfcdn --fix-apt" >&2
@@ -256,16 +378,37 @@ nginx_version_gate() {
   fi
 }
 
-write_global_conf() {
+# 全局片段（map + 所有节点的 cache zone）只有一个写入口。
+# 早期版本把"写 map"和"写 cache zone"分成两个函数，启动时只调前者，
+# 结果把已有的 proxy_cache_path 全冲掉 → nginx -t 报
+# "proxy_cache zone ... is unknown" → 此时 systemd 重启 nginx 会直接起不来。
+# 现在合并为一个幂等函数，启动/增删节点都走它，不会互相覆盖。
+render_global_conf() {
+  mkdir -p "$(dirname "$GLOBAL_CONF")" 2>/dev/null || true
   cat > "$GLOBAL_CONF" <<'NGINX'
 # SelfCDN — 全局片段，由 selfcdn.sh 自动生成
-# 手工修改会在下次增删节点时被覆盖
+# 手工修改会在下次启动或增删节点时被覆盖
 map $http_upgrade $connection_upgrade {
     default upgrade;
     ""      close;
 }
 NGINX
+
+  local n zid
+  while read -r n; do
+    [[ -n $n ]] || continue
+    # shellcheck disable=SC1090
+    source "$(node_file "$n")"
+    [[ ${CACHE_ENABLE:-0} == 1 ]] || continue
+    zid=$(nginx_id "$n")
+    cat >> "$GLOBAL_CONF" <<NGINX
+
+proxy_cache_path $CACHE_ROOT/$n levels=1:2 keys_zone=cdn_${zid}:${CACHE_MEM} max_size=${CACHE_SIZE} inactive=${CACHE_TTL} use_temp_path=off;
+NGINX
+  done < <(list_node_names)
 }
+
+# 兼容旧调用点
 
 ACME_URL="https://acme-v02.api.letsencrypt.org/directory"
 
@@ -340,22 +483,6 @@ normalize_upstream() {
   echo "$h"
 }
 
-rebuild_cache_zones() {
-  write_global_conf
-  local n
-  while read -r n; do
-    [[ -z $n ]] && continue
-    # shellcheck disable=SC1090
-    source "$(node_file "$n")"
-    [[ ${CACHE_ENABLE:-0} == 1 ]] || continue
-    local zid; zid=$(nginx_id "$n")
-    cat >> "$GLOBAL_CONF" <<NGINX
-
-proxy_cache_path $CACHE_ROOT/$n levels=1:2 keys_zone=cdn_${zid}:${CACHE_MEM} max_size=${CACHE_SIZE} inactive=${CACHE_TTL} use_temp_path=off;
-NGINX
-  done < <(list_node_names)
-}
-
 # ---------------------------------------------------------------- 配置生成
 gen_node_conf() {
   local name=$1
@@ -403,8 +530,11 @@ NGINX
 NGINX
 )
   fi
-  local cache_block="${cache_directives}${hdr_https}"
-  local cache_block_http="${cache_directives}${hdr_http}"
+  local cache_block cache_block_http
+  # 命令替换会吃掉末尾换行（连 sed 输出的也吃），不补回来就会把 } 粘到最后一条指令行尾，
+  # 或者把 add_header 挤到同一行。显式补 $'\n' 并去掉空行。
+  cache_block=$( { printf '%s\n' "$cache_directives"; printf '%s\n' "$hdr_https"; } | sed '/^[[:space:]]*$/d' )$'\n'
+  cache_block_http=$( { printf '%s\n' "$cache_directives"; printf '%s\n' "$hdr_http"; } | sed '/^[[:space:]]*$/d' )$'\n'
 
   local common_proxy
   common_proxy=$(cat <<NGINX
@@ -438,7 +568,9 @@ server {
     listen 80;${V6_LISTEN80}
     server_name ${DOMAIN};
 
-    location /.well-known/acme-challenge/ { root ${ACME_ROOT}; }
+    location /.well-known/acme-challenge/ {
+        root ${ACME_ROOT};
+    }
     location / { return 301 https://\$host\$request_uri; }
 }
 
@@ -466,7 +598,9 @@ server {${SSL_LISTEN}
     access_log /var/log/nginx/selfcdn-${name}.access.log;
     error_log  /var/log/nginx/selfcdn-${name}.error.log warn;
 
-    location = /.well-known/acme-challenge/ { return 404; }
+    location = /.well-known/acme-challenge/ {
+        return 404;
+    }
 
     location / {
 ${common_proxy}
@@ -483,7 +617,9 @@ server {
     listen 80;${V6_LISTEN80}
     server_name ${DOMAIN};
 
-    location /.well-known/acme-challenge/ { root ${ACME_ROOT}; }
+    location /.well-known/acme-challenge/ {
+        root ${ACME_ROOT};
+    }
 
     access_log /var/log/nginx/selfcdn-${name}.access.log;
     error_log  /var/log/nginx/selfcdn-${name}.error.log warn;
@@ -517,6 +653,54 @@ nginx_reload() {
     nginx -s reload
   fi
   ok "Nginx 已重载 (v$NGINX_VER)"
+  return 0
+}
+
+node_conf_is_https() {
+  local conf=$NGINX_CONF_D/selfcdn-$1.conf
+  [[ -f $conf ]] && grep -qE '^[[:space:]]*listen[[:space:]]+443' "$conf"
+}
+
+# reload 后旧 worker 还在优雅退出，新连接可能被旧 worker 接走（新 vhost 尚未生效）。
+# 只认状态码会误报：Debian 默认站点对任意 Host 都可能回 200/404，看起来"通了"其实没生效。
+# 所以必须认本节点自己的标记：HTTPS 模式认 301→https，引导模式认 X-CDN-Node 头。
+smoke_check_node() {
+  local name=$1
+  load_node "$name"
+  local i resp code want_https=0
+  node_conf_is_https "$name" && want_https=1
+
+  for i in $(seq 1 20); do
+    resp=$(curl -s -o /dev/null -D - -m 3 -H "Host: $DOMAIN" http://127.0.0.1/ 2>/dev/null || true)
+    code=$(printf '%s' "$resp" | awk 'NR==1{print $2}')
+    [[ -z $code ]] && code=000
+
+    if (( want_https )); then
+      # 443 已启用：80 段应当是「301 跳 https」
+      if [[ $code == 301 ]] && printf '%s' "$resp" | grep -qiE '^location:[[:space:]]*https://'; then
+        ok "本机自检: 80→443 跳转正常（Host: $DOMAIN）"
+        return 0
+      fi
+    else
+      if [[ $code != 000 ]] && printf '%s' "$resp" | grep -qi '^x-cdn-node:'; then
+        case $code in
+          502|503|504) warn "本机自检: HTTP $code —— 回源 $UPSTREAMS 不可达" ;;
+          404)         ok "本机自检: 已命中本站点（HTTP 404，源站没有 /）" ;;
+          *)           ok "本机自检: HTTP $code（Host: $DOMAIN）" ;;
+        esac
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+
+  if [[ $code == 000 ]]; then
+    warn "本机自检未通：127.0.0.1 无响应，检查 nginx 是否在跑"
+  elif (( want_https )); then
+    warn "本机自检: HTTP $code 但无 301 跳转 —— 新配置可能未生效（稍后用菜单 7 重载）"
+  else
+    warn "本机自检: HTTP $code 但未见 X-CDN-Node —— 新配置可能未生效，或被默认站点接管"
+  fi
   return 0
 }
 
@@ -638,19 +822,33 @@ add_node() {
 
   save_node "$name"
   # 不删旧证书：换域名时 $DOMAIN.key 自然对不上，gen_node_conf 会自动回落到引导模式
-  rebuild_cache_zones
+  render_global_conf
   gen_node_conf "$name"
   nginx_test || { err "配置测试失败，节点未启用"; pause; return 1; }
   nginx_reload || { err "重载失败，节点未启用"; pause; return 1; }
+
+  if node_conf_is_https "$name"; then
+    # 证书已就位（复用了该节点已有证书）
+    ok "HTTPS 配置已生效: https://$DOMAIN"
+    smoke_check_node "$name"
+    pause
+    return 0
+  fi
+
   ok "HTTP 引导模式已生效: http://$DOMAIN"
+  smoke_check_node "$name"
 
   local a
   read -rp "现在申请证书并切换 HTTPS？[Y/n]（默认 Y）: " a
   if [[ ! $a =~ ^[Nn]$ ]]; then
     if issue_cert "$name" webroot; then
       gen_node_conf "$name"
-      if nginx_reload; then ok "节点上线: https://$DOMAIN"
-      else err "HTTPS 配置重载失败，节点仍停在 HTTP 模式"; fi
+      if nginx_reload; then
+        smoke_check_node "$name"
+        ok "节点上线: https://$DOMAIN"
+      else
+        err "HTTPS 配置重载失败，节点仍停在 HTTP 模式"
+      fi
     else
       warn "证书未签。稍后可用菜单 4 重试；当前节点仅 HTTP"
     fi
@@ -713,7 +911,7 @@ del_node() {
   rm -rf "$CERT_DIR/$n" "$CACHE_ROOT/$n"
   rm -f "$(node_file "$n")"
   rm -f "/var/log/nginx/selfcdn-$n.access.log" "/var/log/nginx/selfcdn-$n.error.log"
-  rebuild_cache_zones
+  render_global_conf
   nginx_reload || { err "重载失败：请检查 $NGINX_CONF_D"; pause; return 1; }
   ok "节点 $n 已删除"
   pause
@@ -927,7 +1125,14 @@ main_menu() {
    0) 退出
 
 MENU
-    read -rp "选择序号: " choice
+    # stdin 到 EOF（Ctrl-D / 管道输完）时必须退出。
+    # 早期版本不判返回值：choice 为空 → 命中无效分支 → pause 也立即 EOF 返回
+    # → 循环空转，实测能烧 28% CPU 持续十分钟不停。
+    if ! read -rp "选择序号: " choice; then
+      echo
+      ok "输入结束（EOF），退出"
+      exit 0
+    fi
     case ${choice:-} in
       1)  add_node ;;
       2)  list_nodes ;;
@@ -987,11 +1192,12 @@ main() {
   install_deps
   ensure_dirs
   nginx_version_gate
-  write_global_conf
+  render_global_conf
   if ! nginx_reload; then
-    warn "Nginx 初始重载失败，通常是 80/443 已被占用"
-    warn "排查看: ss -lntp | grep -E ':(80|443)\\b'"
-    warn "菜单仍可使用，节点配置已就绪"
+    warn "Nginx 初始加载失败（上方 nginx -t 已给出具体原因）"
+    warn "常见原因：80/443 被占用、配置被外部改动、缓存区定义缺失"
+    warn "排查: ss -lntp | grep -E ':(80|443)\\b'  以及上方报错行"
+    warn "菜单仍可使用；节点增删会自动重建配置"
   fi
   main_menu
 }

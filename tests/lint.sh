@@ -12,7 +12,7 @@ bad()  { printf "  FAIL  %s\n" "$*"; FAIL=$((FAIL+1)); }
 good() { printf "  ok    %s\n" "$*"; }
 
 step "语法检查"
-for f in "$ROOT/selfcdn.sh" "$ROOT/install.sh" "$ROOT/tests/test_render.sh" "$ROOT/tests/test_apt_repair.sh"; do
+for f in "$ROOT/selfcdn.sh" "$ROOT/install.sh" "$ROOT/tests/test_render.sh" "$ROOT/tests/test_apt_repair.sh" "$ROOT/tests/test_eof.sh"; do
   if bash -n "$f" 2>/dev/null; then good "$(basename "$f")"; else bad "$(basename "$f") bash -n"; fi
 done
 
@@ -36,15 +36,31 @@ awk '/^nginx_reload\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'nginx_test' \
 # 危险删除必须有 ${VAR:?} 保护
 grep -q 'rm -rf "${CACHE_ROOT:?}"' "$ROOT/selfcdn.sh" \
   && good "缓存清理有 :? 空值保护" || bad "缓存清理缺 :? 保护"
-# apt update 失败不得直接判死（EOL 发行版会炸）
-awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_repair_ladder' \
-  && good "apt 更新失败走修复阶梯而非直接退出" || bad "pkg_install 仍把 update 失败当致命错误"
+# apt 下载/更新失败必须走升档阶梯，不得直接判死（EOL 发行版会炸）
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_fix_repos_minimal' \
+  && good "pkg_install 含最小修源一级" || bad "pkg_install 缺最小修源升档"
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_move_security_to_archive' \
+  && good "pkg_install 含 security 转归档一级" || bad "pkg_install 缺 security 转归档升档"
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_fix_eol_repos' \
+  && good "pkg_install 含整体归档兜底" || bad "pkg_install 缺整体归档兜底"
+# install 阶段的下载失败（.deb 404）也要触发升档，不能只看 update
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_log_is_fetch_failure' \
+  && good "install 下载失败也升档" || bad "pkg_install 忽略了 install 阶段失败"
 # 源修复必须先备份再改
 awk '/^apt_fix_repos_minimal\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'cp -n .*selfcdn.bak' \
   && good "源修复前有备份" || bad "源修复未备份"
-# 不得硬编码 codename
-grep -qE 'bullseye-security|bookworm-security' "$ROOT/selfcdn.sh" \
-  && bad "脚本里硬编码了具体 codename" || good "无硬编码 codename（按 os-release 推导）"
+# 不得在可执行语句里硬编码具体 codename（注释里提案例可以）
+if grep -vE '^[[:space:]]*#' "$ROOT/selfcdn.sh" | grep -qE '(bullseye|bookworm|focal|jammy)-security'; then
+  bad "硬编码了具体 codename"
+else
+  good "无硬编码 codename（按 os-release 推导）"
+fi
+# 主菜单必须在 stdin EOF 时退出，否则管道/ Ctrl-D 会空转烧 CPU
+awk '/^main_menu\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -qE 'if ! read|read -rp .* \|\|' \
+  && good "主菜单处理 EOF（不会空转）" || bad "主菜单未处理 EOF，可能死循环"
+# 颜色码必须是真实 ESC，否则 cat <<HEREDOC 会打出字面量 \033
+grep -q "R=\$'\\\\033" "$ROOT/selfcdn.sh" \
+  && good "颜色码为真实 ESC（banner 不会打出字面量）" || bad "颜色码是字面量 \\033，banner 会乱"
 
 step "shellcheck"
 if command -v shellcheck >/dev/null 2>&1; then
