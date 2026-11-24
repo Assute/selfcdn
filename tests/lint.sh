@@ -36,16 +36,20 @@ awk '/^nginx_reload\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'nginx_test' \
 # 危险删除必须有 ${VAR:?} 保护
 grep -q 'rm -rf "${CACHE_ROOT:?}"' "$ROOT/selfcdn.sh" \
   && good "缓存清理有 :? 空值保护" || bad "缓存清理缺 :? 保护"
-# apt 下载/更新失败必须走升档阶梯，不得直接判死（EOL 发行版会炸）
-awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_fix_repos_minimal' \
-  && good "pkg_install 含最小修源一级" || bad "pkg_install 缺最小修源升档"
-awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_move_security_to_archive' \
-  && good "pkg_install 含 security 转归档一级" || bad "pkg_install 缺 security 转归档升档"
-awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_fix_eol_repos' \
-  && good "pkg_install 含整体归档兜底" || bad "pkg_install 缺整体归档兜底"
+# update 失败时必须先修源再装：否则 install 会靠旧索引蒙成功，把坏源留给用户
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'refreshed=0' \
+  && good "pkg_install 感知 update 失败" || bad "pkg_install 不感知 update 失败"
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_repair_ladder' \
+  && good "update 失败先走修源阶梯" || bad "update 失败未先修源"
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q '索引仍不可用' \
+  && good "修源失败有明确告警（不静默留坏源）" || bad "修源失败仍静默成功"
 # install 阶段的下载失败（.deb 404）也要触发升档，不能只看 update
 awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_log_is_fetch_failure' \
   && good "install 下载失败也升档" || bad "pkg_install 忽略了 install 阶段失败"
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_move_security_to_archive' \
+  && good "升档含 security 转归档" || bad "缺 security 转归档升档"
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_fix_eol_repos' \
+  && good "升档含整体归档兜底" || bad "缺整体归档兜底"
 # 源修复必须先备份再改
 awk '/^apt_fix_repos_minimal\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'cp -n .*selfcdn.bak' \
   && good "源修复前有备份" || bad "源修复未备份"

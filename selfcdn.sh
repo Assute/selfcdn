@@ -265,35 +265,50 @@ apt_repair_ladder() {
 pkg_install() {
   case $PKG in
     apt)
-      # 阶梯式：直装 → 最小修源 → security 挪归档 → 整体归档
-      # 关键：install 阶段的下载失败（.deb 404）同样要升档，不能只看 update
-      apt_refresh >/dev/null 2>&1 || true
+      # 阶梯式：先修源再装 → 装不上再按下载失败升档。
+      #
+      # 为什么必须先修源：apt-get update 失败时，apt-get install 仍可能靠
+      # /var/lib/apt/lists 里的旧索引"蒙"成功。若这时直接 return，装是装上了，
+      # 但 sources.list 一行没改、备份也没有，用户下次 update 继续炸。
+      # 线上实测确有此现象（install 成功、源仍坏、无备份）。
+      local refreshed=1
+      apt_refresh >/dev/null 2>&1 || refreshed=0
 
-      apt_install_quiet "$@" && return 0
+      if (( ! refreshed )); then
+        warn "apt 索引更新失败，先尝试修复软件源"
+        if apt_repair_ladder; then
+          refreshed=1
+        else
+          warn "自动修源未成功，尝试用现有缓存索引安装"
+        fi
+      fi
+
+      apt_install_quiet "$@" && {
+        if (( refreshed )); then
+          return 0
+        fi
+        warn "安装成功，但 apt 索引仍不可用；软件源需手工检查（selfcdn --fix-apt）"
+        return 0
+      }
 
       if ! apt_log_is_fetch_failure; then
         err "apt 安装失败（非软件源问题）:"
         apt_log_tail
         return 1
       fi
+
       warn "包下载失败：索引里引用的 .deb 已不在镜像上"
-
-      if apt_fix_repos_minimal; then
-        apt_refresh >/dev/null 2>&1 || true
-        apt_install_quiet "$@" && { ok "最小修源后安装成功"; return 0; }
-        apt_log_is_fetch_failure || { err "安装失败:"; apt_log_tail; return 1; }
-      fi
-
-      if apt_move_security_to_archive; then
-        apt_refresh >/dev/null 2>&1 || true
-        apt_install_quiet "$@" && { ok "security 转归档后安装成功"; return 0; }
-        apt_log_is_fetch_failure || { err "安装失败:"; apt_log_tail; return 1; }
-      fi
-
-      if apt_fix_eol_repos; then
-        apt_refresh >/dev/null 2>&1 || true
-        apt_install_quiet "$@" && { ok "整体切归档后安装成功"; return 0; }
-      fi
+      local rung
+      for rung in apt_fix_repos_minimal apt_move_security_to_archive apt_fix_eol_repos; do
+        if "$rung"; then
+          apt_refresh >/dev/null 2>&1 || true
+          if apt_install_quiet "$@"; then
+            ok "$rung 后安装成功"
+            return 0
+          fi
+          apt_log_is_fetch_failure || { err "安装失败:"; apt_log_tail; return 1; }
+        fi
+      done
 
       err "依赖安装仍失败，最后错误:"
       apt_log_tail
