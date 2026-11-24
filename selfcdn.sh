@@ -17,6 +17,11 @@ ACME_ROOT=/var/www/selfcdn-acme
 ACME_HOME=/root/.acme.sh
 ACME_SH=$ACME_HOME/acme.sh
 
+# apt 源路径（可在测试中被覆盖）
+APT_SOURCES=${APT_SOURCES:-/etc/apt/sources.list}
+APT_SOURCES_D=${APT_SOURCES_D:-/etc/apt/sources.list.d}
+APT_CONF_D=${APT_CONF_D:-/etc/apt/apt.conf.d}
+
 R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[36m'; D='\033[2m'; N='\033[0m'
 
 info() { printf "${B}[*]${N} %s\n" "$*"; }
@@ -39,9 +44,143 @@ detect_os() {
   fi
 }
 
+apt_sources_files() {
+  local f
+  [[ -f $APT_SOURCES ]] && printf '%s\n' "$APT_SOURCES"
+  if [[ -d $APT_SOURCES_D ]]; then
+    for f in "$APT_SOURCES_D"/*.list; do
+      [[ -f $f ]] && printf '%s\n' "$f"
+    done
+  fi
+}
+
+get_debian_codename() {
+  local c=""
+  [[ -r /etc/os-release ]] && c=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
+  [[ -z $c && -r /etc/lsb-release ]] && c=$(. /etc/lsb-release 2>/dev/null; printf '%s' "${DISTRIB_CODENAME:-}")
+  # 兜底：从现有源的主发行版行反推 suite（自定义镜像常缺 VERSION_CODENAME）
+  if [[ -z $c ]]; then
+    c=$(apt_sources_files | while read -r f; do
+          [[ -n $f ]] || continue
+          awk '
+            /^[[:space:]]*#/ { next }
+            $1=="deb" && $2 ~ /debian/ {
+              s=$3
+              sub(/-security$|-updates$|-backports$/, "", s)
+              sub(/\/.*$/, "", s)
+              if (s ~ /^[a-z]+$/) { print s; exit }
+            }
+          ' "$f"
+        done | head -1)
+  fi
+  printf '%s' "$c"
+}
+
+# 第一级：最小修复。只剔除已废弃的 <codename>/updates 与 *-backports 行，
+# 并把 security 源补正为 security.debian.org/debian-security <codename>-security。
+# 没有直接切归档，是因为主源常常还在正常维护（LTS 期），切了会丢安全更新。
+apt_fix_repos_minimal() {
+  local codename f changed=0 comps tmp
+  codename=$(get_debian_codename)
+  [[ -n $codename ]] || return 1
+
+  while read -r f; do
+    [[ -n $f ]] || continue
+    grep -qE 'deb\.debian\.org|security\.debian\.org' "$f" 2>/dev/null || continue
+    # 只认真正的坏行：过时的 /<suite>/updates、*-backports、security 缺 /debian-security 路径
+    grep -qE '/[A-Za-z]+/updates([[:space:]]|$)|-backports|security\.debian\.org([[:space:]]|$)' "$f" 2>/dev/null || continue
+
+    cp -n "$f" "$f.selfcdn.bak" 2>/dev/null || true
+
+    # 组件列表沿用该源里主发行版那一行，避免擅自打开非 free 组件
+    comps=$(awk -v cn="$codename" '
+      $1=="deb" && $3==cn { for (i=4;i<=NF;i++) printf "%s%s", (i>4?" ":""), $i; exit }
+    ' "$f")
+    [[ -z $comps ]] && comps="main"
+
+    tmp=$(mktemp)
+    awk '
+      /^[[:space:]]*#/           { print; next }
+      /security\.debian\.org/    { next }
+      /-backports/               { next }
+      /\/[A-Za-z]+\/updates([[:space:]]|$)/ { next }
+      { print }
+    ' "$f" > "$tmp"
+    # 已有正确的 security 源就不再追加，避免 "configured multiple times"
+    if ! grep -q 'security\.debian\.org/debian-security' "$tmp" 2>/dev/null; then
+      printf 'deb http://security.debian.org/debian-security %s-security %s\n' "$codename" "$comps" >> "$tmp"
+    fi
+    mv "$tmp" "$f"
+    changed=1
+    info "已剔除废弃行并补正 security 源: $f（备份 *.selfcdn.bak）"
+  done < <(apt_sources_files)
+
+  (( changed )) && { ok "Debian 源已最小化修复"; return 0; }
+  return 1
+}
+
+# 第二级：主源也失效（发行版彻底 EOL）时，整体切到 archive.debian.org，
+# 并关闭 Valid-Until 校验（归档源 Release 已过期）。
+apt_fix_eol_repos() {
+  local changed=0 f
+  while read -r f; do
+    [[ -n $f ]] || continue
+    grep -qE 'deb\.debian\.org|security\.debian\.org|ftp\.debian\.org|ftp\.cn\.debian\.org' "$f" 2>/dev/null || continue
+    cp -n "$f" "$f.selfcdn.bak" 2>/dev/null || true
+    sed -i \
+      -e 's|https\?://deb\.debian\.org/debian|https://archive.debian.org/debian|g' \
+      -e 's|https\?://ftp\.debian\.org/debian|https://archive.debian.org/debian|g' \
+      -e 's|https\?://ftp\.cn\.debian\.org/debian|https://archive.debian.org/debian|g' \
+      -e 's|https\?://security\.debian\.org/debian-security|https://archive.debian.org/debian-security|g' \
+      -e 's|https\?://security\.debian\.org|https://archive.debian.org|g' \
+      -e '/-backports/d' \
+      -e '/\/[A-Za-z]*\/updates/d' \
+      "$f"
+    changed=1
+    info "已改写源: $f（备份 *.selfcdn.bak）"
+  done < <(apt_sources_files)
+
+  if (( changed )); then
+    mkdir -p "$APT_CONF_D" 2>/dev/null || true
+    printf 'Acquire::Check-Valid-Until "false";\n' > "$APT_CONF_D/99selfcdn-archive" 2>/dev/null || true
+    ok "已切到 archive.debian.org，关闭 Valid-Until 校验"
+    return 0
+  fi
+  return 1
+}
+
+apt_refresh() {
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq
+}
+
+# 阶梯：正常更新 → 最小修复 → 归档兜底。任何一级成功即停。
+apt_repair_ladder() {
+  local tried_min=0
+  if apt_refresh; then return 0; fi
+
+  warn "apt 索引更新失败，判断为源失效（发行版过旧 / 过时仓库行）"
+  if apt_fix_repos_minimal; then
+    tried_min=1
+    if apt_refresh; then return 0; fi
+    warn "最小修复后仍失败，主源可能也已归档"
+  else
+    warn "未发现可最小修复的坏行"
+  fi
+
+  if apt_fix_eol_repos; then
+    if apt_refresh; then return 0; fi
+    warn "切归档源后仍更新失败，检查网络 / DNS / 代理"
+  fi
+  (( tried_min )) || warn "未能自动修复，请手工检查 /etc/apt/sources.list"
+  return 1
+}
+
 pkg_install() {
   case $PKG in
-    apt) DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+    apt)
+      apt_repair_ladder || warn "索引更新未成功，仍尝试安装（可能命中本地缓存）"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+      ;;
     dnf) dnf install -y -q "$@" ;;
     yum) yum install -y -q "$@" ;;
   esac
@@ -56,7 +195,26 @@ install_deps() {
   command -v crontab >/dev/null 2>&1 || miss+=(cron)
   if [[ ${#miss[@]} -gt 0 ]]; then
     info "安装依赖: ${miss[*]}"
-    pkg_install "${miss[@]}" || die "依赖安装失败"
+    if ! pkg_install "${miss[@]}"; then
+      err "依赖安装失败: ${miss[*]}"
+      if [[ $PKG == apt ]]; then
+        echo "    该机可能是已 EOL 的 Debian 版本。手工修复：" >&2
+        echo "      cp /etc/apt/sources.list /etc/apt/sources.list.bak" >&2
+        echo "      sed -i 's|deb.debian.org/debian|archive.debian.org/debian|g; s|security.debian.org|archive.debian.org|g' /etc/apt/sources.list" >&2
+        echo "      echo 'Acquire::Check-Valid-Until \"false\";' > /etc/apt/apt.conf.d/99archive" >&2
+        echo "      apt-get update && apt-get install -y ${miss[*]}" >&2
+        echo "    或直接: selfcdn --fix-apt" >&2
+      fi
+      die "请修复软件源后重试"
+    fi
+    # 装完复核：真装上了才算数
+    local still=()
+    command -v nginx   >/dev/null 2>&1 || still+=(nginx)
+    command -v curl    >/dev/null 2>&1 || still+=(curl)
+    command -v openssl >/dev/null 2>&1 || still+=(openssl)
+    if [[ ${#still[@]} -gt 0 ]]; then
+      die "依赖仍未就绪: ${still[*]}（apt 报告成功但命令不存在，检查包名或 PATH）"
+    fi
   fi
   if command -v systemctl >/dev/null 2>&1; then
     systemctl enable --now nginx >/dev/null 2>&1 || true
@@ -791,7 +949,40 @@ MENU
   done
 }
 
+usage() {
+  cat <<EOF
+SelfCDN $VERSION — 自建 CDN 边缘节点
+
+用法:
+  selfcdn              进菜单（默认）
+  selfcdn --fix-apt    修复已 EOL 的 Debian 源（切 archive.debian.org）并更新索引
+  selfcdn --check      只做环境检查，不进菜单
+  selfcdn --version    版本
+  selfcdn --help       本帮助
+EOF
+}
+
 main() {
+  case ${1:-} in
+    -h|--help) usage; exit 0 ;;
+    -v|--version) echo "SelfCDN $VERSION"; exit 0 ;;
+    --fix-apt)
+      need_root; detect_os
+      [[ $PKG == apt ]] || die "仅 Debian/Ubuntu 需要该操作（当前非 apt 系统）"
+      if apt_repair_ladder; then
+        ok "apt 源已修复，索引更新完成"
+      else
+        err "自动修复失败。当前 sources.list："
+        while read -r f; do [[ -n $f ]] && sed 's/^/    /' "$f"; done < <(apt_sources_files)
+        exit 1
+      fi
+      exit 0 ;;
+    --check)
+      need_root; detect_os; install_deps; nginx_version_gate
+      ok "环境检查通过: nginx $NGINX_VER / pkg=$PKG"
+      exit 0 ;;
+  esac
+
   need_root
   install_deps
   ensure_dirs

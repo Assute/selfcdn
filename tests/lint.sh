@@ -12,7 +12,7 @@ bad()  { printf "  FAIL  %s\n" "$*"; FAIL=$((FAIL+1)); }
 good() { printf "  ok    %s\n" "$*"; }
 
 step "语法检查"
-for f in "$ROOT/selfcdn.sh" "$ROOT/install.sh" "$ROOT/tests/test_render.sh"; do
+for f in "$ROOT/selfcdn.sh" "$ROOT/install.sh" "$ROOT/tests/test_render.sh" "$ROOT/tests/test_apt_repair.sh"; do
   if bash -n "$f" 2>/dev/null; then good "$(basename "$f")"; else bad "$(basename "$f") bash -n"; fi
 done
 
@@ -36,6 +36,15 @@ awk '/^nginx_reload\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'nginx_test' \
 # 危险删除必须有 ${VAR:?} 保护
 grep -q 'rm -rf "${CACHE_ROOT:?}"' "$ROOT/selfcdn.sh" \
   && good "缓存清理有 :? 空值保护" || bad "缓存清理缺 :? 保护"
+# apt update 失败不得直接判死（EOL 发行版会炸）
+awk '/^pkg_install\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'apt_repair_ladder' \
+  && good "apt 更新失败走修复阶梯而非直接退出" || bad "pkg_install 仍把 update 失败当致命错误"
+# 源修复必须先备份再改
+awk '/^apt_fix_repos_minimal\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -q 'cp -n .*selfcdn.bak' \
+  && good "源修复前有备份" || bad "源修复未备份"
+# 不得硬编码 codename
+grep -qE 'bullseye-security|bookworm-security' "$ROOT/selfcdn.sh" \
+  && bad "脚本里硬编码了具体 codename" || good "无硬编码 codename（按 os-release 推导）"
 
 step "shellcheck"
 if command -v shellcheck >/dev/null 2>&1; then

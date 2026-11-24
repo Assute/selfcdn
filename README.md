@@ -22,6 +22,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Assute/selfcdn/main/install.
 `install.sh` 会把 `selfcdn.sh` 下到 `/usr/local/sbin/selfcdn`（做完整性 + 语法校验），
 装完直接进菜单。之后随时 `selfcdn` 回车。
 
+其他用法：
+
+```bash
+selfcdn --fix-apt     # 修复过时 Debian 源并更新索引（EOL / updates / backports 失效时用）
+selfcdn --check       # 只做环境检查，不进菜单
+selfcdn --version
+```
+
 不放心进程替换，分两步：
 
 ```bash
@@ -185,7 +193,7 @@ acme.sh 装的时候已经写进 cron（每天跑），正常不用管。手动�
 
 ## 已验证 / 未验证
 
-**已离线验证**（`bash tests/test_render.sh` 37 项 + `bash tests/lint.sh`）：
+**已离线验证**（`tests/test_render.sh` 37 项 + `tests/test_apt_repair.sh` 24 项 + `tests/lint.sh`）：
 
 配置生成结构、占位符全替换、HTTP 引导期不下发 HSTS、HTTPS 期证书路径、
 连字符节点名转下划线做 Nginx ID、缓存关闭时不残留 `proxy_cache`、
@@ -193,7 +201,11 @@ acme.sh 装的时候已经写进 cron（每天跑），正常不用管。手动�
 IPv6 关闭时不生成 `[::]` 监听、无残缺 `listen` 行、
 `reload` 前强制 `nginx_test`、`rm -rf` 无未加引号变量、`${VAR:?}` 空值保护。
 
-**未在线验证**：证书签发全链路、真实 Nginx 下的缓存命中。
+Debian 源修复两级阶梯用真实坏源样本复刻验证：主源保留不误切归档、旧 `*/updates` 与
+`backports` 剔除、security 源路径与组件补正、备份生成且备份内容保持原样、二次执行幂等、
+自建镜像与健康官方源不被误伤、`sources.list.d` 一并处理。
+
+**未在线验证**：证书签发全链路、真实 Nginx 下的缓存命中、`apt` 实际安装过程。
 本机没有任何 Linux 运行时（WSL 无发行版、无 Docker），`nginx -t` 只在目标机执行，
 脚本每次 reload 前都强制过这一关，不过即中止。
 
@@ -202,13 +214,50 @@ IPv6 关闭时不生成 `[::]` 监听、无残缺 `listen` 行、
 自测命令：
 
 ```bash
-bash tests/test_render.sh    # 离线渲染验证，不碰系统
-bash tests/lint.sh           # 语法 + 反模式扫描 + shellcheck（若装）
+bash tests/test_render.sh      # 配置离线渲染，不碰系统
+bash tests/test_apt_repair.sh  # Debian 源修复逻辑，不调 apt
+bash tests/lint.sh             # 语法 + 反模式扫描 + shellcheck（若装）
 ```
 
 ---
 
 ## 排障
+
+**`apt-get update` 报 `does not have a Release file`（Debian 老版本）**：
+
+典型输出：
+
+```
+E: The repository 'http://security.debian.org bullseye/updates Release' does not have a Release file.
+E: The repository 'http://deb.debian.org/debian bullseye-backports Release' does not have a Release file.
+```
+
+原因是 Debian 11 及更早的 `security.debian.org <codename>/updates` 这种旧写法早已废弃，
+`*-backports` 在发行版进入 LTS/归档后也会被撤。脚本现在会自动处理，走两级阶梯：
+
+1. **最小修复**：删掉过时的 `/<suite>/updates` 与 `*-backports` 行，把 security 源补正为
+   `http://security.debian.org/debian-security <codename>-security`。
+   **主源仍是 deb.debian.org**，不会把还在维护的发行版冻到归档站。
+2. **归档兜底**：只有第一级之后仍失败（发行版彻底 EOL、主源也撤了）才整体切
+   `archive.debian.org`，并写 `Acquire::Check-Valid-Until "false";` 让它接受过期 Release。
+
+两级都会先备份成 `*.selfcdn.bak`。手动触发：
+
+```bash
+selfcdn --fix-apt
+```
+
+改坏了回滚：
+
+```bash
+mv /etc/apt/sources.list.selfcdn.bak /etc/apt/sources.list
+rm -f /etc/apt/apt.conf.d/99selfcdn-archive
+apt-get update
+```
+
+codename 从 `/etc/os-release` 取，取不到就从现有源的 suite 反推，不硬编码。
+
+---
 
 **`nginx -t` 失败**：看输出里指的行。最常见是 80/443 被占用（
 `ss -lntp | grep :80` 找现行监听，通常是自带的 default_server）。
