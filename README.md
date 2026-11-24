@@ -233,8 +233,13 @@ acme.sh 装的时候已经写进 cron（每天跑），正常不用管。手动�
 | 已有节点时重复启动脚本 | ✅ 不再破坏配置（见下方踩坑记录） |
 | stdin EOF（管道 / Ctrl-D） | ✅ 立即退出，不空转 |
 | 全新装机（坏源 + 无 nginx） | ✅ 自动修源 + 备份 + 装 nginx，一次跑通 |
+| **真实 Let's Encrypt 签发** | ✅ `cgdgrs.hsaoyun.com` 签发成功，链 4 张，`Verify return code: 0 (ok)` |
+| 公网 HTTPS 访问 | ✅ HTTP/2 200，TLS1.2 与 TLS1.3 均通，HSTS 下发 |
+| 自动续期 | ✅ acme cron 已装，有效期 90 天 |
 
-### 真机实测挖出并修掉的 7 个 bug
+真机线上实例：`https://cgdgrs.hsaoyun.com/` → 回源 `70.39.202.242:7001`，直连与经 CDN 均 200。
+
+### 真机实测挖出并修掉的 8 个 bug
 
 这些都是离线测试看不出来、只有真跑才会暴露的：
 
@@ -257,25 +262,32 @@ acme.sh 装的时候已经写进 cron（每天跑），正常不用管。手动�
 7. **安装器拿到 CDN 缓存里的旧脚本** —— push 后立刻跑 `install.sh`，
    拿到的仍是上一次提交的内容。修法：下载 URL 加时间戳击穿缓存 +
    关键函数存在性校验 + 打印实际版本号。
+8. **占位邮箱把证书签发彻底堵死** —— acme.sh 的账户邮箱存在
+   `/root/.acme.sh/account.conf` 的 `ACCOUNT_EMAIL`，只改 `/etc/selfcdn/email`
+   不生效，旧坏值会一直被沿用。填 `example.com` 这类保留域名时 LE 直接
+   400 `invalidContact`，而旧版还把失败误报成"DNS 未生效 / 80 被封"。
+   修法：校验 RFC 2606 保留域名 + 同步 account.conf + 按原因分类诊断 +
+   账户类错误不再无意义地降级 standalone 重试。
 
 ### 离线测试
 
-`tests/test_render.sh` 50 项 · `tests/test_apt_repair.sh` 43 项 · `tests/test_eof.sh` 9 项 · `tests/lint.sh`
+`tests/test_render.sh` 50 项 · `tests/test_apt_repair.sh` 43 项 ·
+`tests/test_eof.sh` 9 项 · `tests/test_email.sh` 43 项 · `tests/lint.sh`
 
 覆盖：配置结构、占位符全替换、HTTP/HTTPS 两种模式的安全头差异、证书路径、
 连字符节点名转下划线、缓存关闭时不残留 `proxy_cache`、节点登记 `%q` 往返
 （含 `$host` 变量转义）、IPv6 关闭时不生成 `[::]`、指令逐行、zone 不丢不重、
-apt 四级阶梯各分支、EOF 与非法输入退出。
+apt 四级阶梯各分支、EOF 与非法输入退出、
+ACME 邮箱保留域名拦截与 account.conf 同步、失败分类诊断文案。
 
 ### 未验证
 
-- **真实 Let's Encrypt 签发全链路**：需要域名 A 记录指向该机，测试环境没有域名。
-  HTTPS 配置分支已用自签证书在真 nginx 上验过，但 `acme.sh --issue` 走到 LE 的
-  这一段没跑（会注册真实 ACME 账户）。
-- **高并发 / 大文件 / 长连接**压力表现。
+- **高并发 / 大文件 / 长连接**压力表现（只做了单请求功能验证）。
 - Ubuntu、RHEL 系发行版（只在 Debian 11 上跑过）。
+- 通配符证书、多域名（SAN）证书：目前一个节点签一个域名。
+- HTTP/3（QUIC）：未启用。
 
-**第一次请拿测试域名跑**，别直接上生产域名。
+**第一次建议拿测试子域名跑**，确认无误再把生产域名指过来。
 
 自测命令：
 
