@@ -4,7 +4,7 @@
 # target: Debian/Ubuntu · RHEL/CentOS/Rocky/Alma · 需 root
 set -uo pipefail
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 
 BASE=/etc/selfcdn
 NODES_DIR=$BASE/nodes
@@ -1144,7 +1144,7 @@ issue_one() {
   node_exists "$n" || die "节点不存在: $n"
   if issue_cert "$n" webroot; then
     gen_node_conf "$n"
-    if nginx_reload; then ok "证书已签发并切换 HTTPS"; else err "重载失败"; fi
+    if nginx_reload; then ok "证书已就绪，节点已切到 HTTPS"; else err "重载失败"; fi
   fi
   pause
 }
