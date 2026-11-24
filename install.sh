@@ -3,8 +3,8 @@
 # SelfCDN 一键安装：拉取脚本到 /usr/local/sbin/selfcdn 并执行
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/Assute/selfcdn/main/selfcdn.sh"
-DEST="/usr/local/sbin/selfcdn"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/Assute/selfcdn/main/selfcdn.sh}"
+DEST="${DEST:-/usr/local/sbin/selfcdn}"
 
 R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[36m'; N='\033[0m'
 info() { printf "${B}[*]${N} %s\n" "$*"; }

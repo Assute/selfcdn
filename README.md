@@ -43,6 +43,17 @@ chmod +x /usr/local/sbin/selfcdn && selfcdn
 bash <(curl -fsSL https://raw.githubusercontent.com/Assute/selfcdn/main/selfcdn.sh)
 ```
 
+> **刚推了新版本，想立刻拿到？** `raw.githubusercontent.com` 走 CDN，会缓存几分钟。
+> 实测踩过：push 完马上重跑，拿到的还是上一次的脚本（版本号都一样，看不出来）。
+> 给 URL 加时间戳击穿缓存：
+>
+> ```bash
+> bash <(curl -fsSL "https://raw.githubusercontent.com/Assute/selfcdn/main/install.sh?$(date +%s)")
+> ```
+>
+> `install.sh` 内部下载 `selfcdn.sh` 时已自动带时间戳，并且会校验关键函数是否齐全、
+> 打印实际版本号；拿到串版或截断内容会拒绝安装。
+
 ### 前置条件
 
 | 项 | 要求 |
@@ -221,8 +232,9 @@ acme.sh 装的时候已经写进 cron（每天跑），正常不用管。手动�
 | HSTS / 安全头 | ✅ HTTPS 下发，HTTP 引导期不下发 |
 | 已有节点时重复启动脚本 | ✅ 不再破坏配置（见下方踩坑记录） |
 | stdin EOF（管道 / Ctrl-D） | ✅ 立即退出，不空转 |
+| 全新装机（坏源 + 无 nginx） | ✅ 自动修源 + 备份 + 装 nginx，一次跑通 |
 
-### 真机实测挖出并修掉的 5 个 bug
+### 真机实测挖出并修掉的 7 个 bug
 
 这些都是离线测试看不出来、只有真跑才会暴露的：
 
@@ -232,12 +244,19 @@ acme.sh 装的时候已经写进 cron（每天跑），正常不用管。手动�
    修法：合并成单一 `render_global_conf()`，启动与增删节点都走它。
 2. **apt 只在 update 失败时升档** —— 实况是索引正常、pool 里的 `.deb` 已 404，
    `install` 阶段才炸。修法：新增「install 下载失败也升档」，并区分源问题和安装冲突。
-3. **`add_header` 被拼到同一行** —— 命令替换吃掉末尾换行，多条指令挤在一行、
-   `}` 粘在行尾。nginx 能解析但极脆。修法：显式补 `$'\n'`。
-4. **自检误报成功** —— 只看状态码，Debian 默认站点回的 200 被当成"通了"。
+3. **靠旧索引蒙成功后把坏源留给用户** —— `update` 失败但 `install` 靠
+   `/var/lib/apt/lists` 的缓存装成功了，原实现直接 return，
+   结果 `sources.list` 一行没改、备份也没有，用户下次 `update` 继续炸。
+   修法：**先探测 update，失败就先修源再装**；修源失败才退回缓存，且仍明确告警。
+4. **`add_header` 被拼到同一行** —— 命令替换吃掉末尾换行，多条指令挤在一行、
+   `}` 粘在行尾。nginx 能解析但极脆。修法：显式补换行符。
+5. **自检误报成功** —— 只看状态码，Debian 默认站点回的 200 被当成"通了"。
    修法：改成认本节点标记头（或 301→https），并把重试拉到 10 秒兜住 reload 窗口。
-5. **stdin EOF 死循环** —— `read` 返回非 0 时 `choice` 为空 → 无效分支 →
+6. **stdin EOF 死循环** —— `read` 返回非 0 时 `choice` 为空 → 无效分支 →
    `pause` 也立即返回 → 空转。实测烧 28% CPU 十分钟不停。修法：判 `read` 返回值并退出。
+7. **安装器拿到 CDN 缓存里的旧脚本** —— push 后立刻跑 `install.sh`，
+   拿到的仍是上一次提交的内容。修法：下载 URL 加时间戳击穿缓存 +
+   关键函数存在性校验 + 打印实际版本号。
 
 ### 离线测试
 
@@ -349,6 +368,13 @@ LE 对该域名多次失败已限流（等一周）。
 **回源 404/421**：回源 Host 头配错了，见上文。
 
 **改了配置不生效**：菜单 `7` 重载。如果报配置错，脚本会打印 `nginx -t` 原文。
+
+**刚加完节点马上访问不到**：正常。`systemctl reload` 是优雅重载，旧 worker 会在
+几秒内继续接新连接。等两三秒，或者用菜单 `7` 再重载一次。脚本自检会重试 10 秒并
+只认本节点标记，不会误报。
+
+**重跑 install.sh 却像是没更新**：`raw.githubusercontent.com` 有 CDN 缓存。
+用带时间戳的 URL 强制拿最新（见「一键安装」那节）。
 
 ---
 
