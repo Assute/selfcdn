@@ -43,16 +43,20 @@ chmod +x /usr/local/sbin/cdn && cdn
 bash <(curl -fsSL https://raw.githubusercontent.com/Assute/selfcdn/main/selfcdn.sh)
 ```
 
-> **刚推了新版本，想立刻拿到？** `raw.githubusercontent.com` 走 CDN，会缓存几分钟。
-> 实测踩过：push 完马上重跑，拿到的还是上一次的脚本（版本号都一样，看不出来）。
-> 给 URL 加时间戳击穿缓存：
+> **`raw.githubusercontent.com` 会滞后最多 5 分钟**，实测响应头是
+> `cache-control: max-age=300`，而且**查询参数不参与缓存键**
+> （`?cb=123` 和裸 URL 返回同一个 `etag`，加时间戳没用）。
+>
+> `install.sh` 内部已经处理了：先用 GitHub API 把 `main` 解析成 commit SHA，
+> 再按 SHA 取脚本——同一 SHA 的内容不可变，永远是最新提交。API 被限流时退到
+> jsDelivr，最后才退到可能滞后的裸 raw。安装时会打印来源和版本号，
+> 并校验关键函数是否齐全，拿到串版或截断内容直接拒绝安装。
+>
+> 要确认自己装的是哪个提交：
 >
 > ```bash
-> bash <(curl -fsSL "https://raw.githubusercontent.com/Assute/selfcdn/main/install.sh?$(date +%s)")
+> cdn --version && grep -c 'issue_cert()' /usr/local/sbin/cdn
 > ```
->
-> `install.sh` 内部下载 `selfcdn.sh` 时已自动带时间戳，并且会校验关键函数是否齐全、
-> 打印实际版本号；拿到串版或截断内容会拒绝安装。
 
 ### 前置条件
 
