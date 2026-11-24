@@ -1,0 +1,6 @@
+# 依赖 / 产物忽略
+*.log
+.tmp/
+.DS_Store
+*.swp
+*~

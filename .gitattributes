@@ -1,0 +1,13 @@
+# 全部文本强制 LF —— shell 脚本带 CRLF 在 Linux 上 shebang 会直接崩
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.md    text eol=lf
+*.conf  text eol=lf
+
+# 二进制
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.zip   binary
+*.gz    binary
