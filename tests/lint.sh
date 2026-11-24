@@ -12,7 +12,7 @@ bad()  { printf "  FAIL  %s\n" "$*"; FAIL=$((FAIL+1)); }
 good() { printf "  ok    %s\n" "$*"; }
 
 step "语法检查"
-for f in "$ROOT/selfcdn.sh" "$ROOT/install.sh" "$ROOT/tests/test_render.sh" "$ROOT/tests/test_apt_repair.sh" "$ROOT/tests/test_eof.sh"; do
+for f in "$ROOT/selfcdn.sh" "$ROOT/install.sh" "$ROOT/tests/test_render.sh" "$ROOT/tests/test_apt_repair.sh" "$ROOT/tests/test_eof.sh" "$ROOT/tests/test_email.sh"; do
   if bash -n "$f" 2>/dev/null; then good "$(basename "$f")"; else bad "$(basename "$f") bash -n"; fi
 done
 
@@ -59,7 +59,13 @@ if grep -vE '^[[:space:]]*#' "$ROOT/selfcdn.sh" | grep -qE '(bullseye|bookworm|f
 else
   good "无硬编码 codename（按 os-release 推导）"
 fi
-# 主菜单必须在 stdin EOF 时退出，否则管道/ Ctrl-D 会空转烧 CPU
+# ACME 邮箱必须校验保留域名，否则 LE 直接 400 invalidContact（线上踩过）
+grep -q 'is_forbidden_email' "$ROOT/selfcdn.sh" \
+  && good "校验 LE 保留域名邮箱" || bad "未校验保留域名邮箱（example.com 会导致签发失败）"
+grep -q 'sync_acme_email' "$ROOT/selfcdn.sh" \
+  && good "邮箱同步到 acme.sh account.conf" || bad "只写 /etc/selfcdn/email 不生效，未同步 acme.sh"
+grep -q 'diagnose_acme_failure' "$ROOT/selfcdn.sh" \
+  && good "ACME 失败按原因分类诊断" || bad "ACME 失败未分类诊断"# 主菜单必须在 stdin EOF 时退出，否则管道/ Ctrl-D 会空转烧 CPU
 awk '/^main_menu\(\)/,/^}/' "$ROOT/selfcdn.sh" | grep -qE 'if ! read|read -rp .* \|\|' \
   && good "主菜单处理 EOF（不会空转）" || bad "主菜单未处理 EOF，可能死循环"
 # 颜色码必须是真实 ESC，否则 cat <<HEREDOC 会打出字面量 \033

@@ -4,7 +4,7 @@
 # target: Debian/Ubuntu · RHEL/CentOS/Rocky/Alma · 需 root
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 BASE=/etc/selfcdn
 NODES_DIR=$BASE/nodes
@@ -429,22 +429,113 @@ ACME_URL="https://acme-v02.api.letsencrypt.org/directory"
 
 acme_present() { [[ -x $ACME_SH ]]; }
 
-ensure_acme() {
-  acme_present && return 0
+# Let's Encrypt 会拒绝 RFC 2606 保留域名下的联系邮箱
+# （实测报错：contact email has forbidden domain "example.com"）。
+# 占位邮箱一旦写进 acme.sh 的 account.conf 会一直沿用，必须先拦住。
+EMAIL_FORBIDDEN_DOMAINS="example.com example.net example.org example.edu test.com localhost invalid local"
+
+is_forbidden_email() {
+  local e=$1 d
+  d=${e##*@}
+  d=$(printf '%s' "$d" | tr 'A-Z' 'a-z')
+  local f
+  for f in $EMAIL_FORBIDDEN_DOMAINS; do
+    [[ $d == "$f" ]] && return 0
+  done
+  # RFC 2606 保留 TLD / 后缀
+  case $d in
+    *.example|*.invalid|*.localhost|*.test|*.local) return 0 ;;
+  esac
+  return 1
+}
+
+is_valid_email() {
+  local e=$1
+  [[ -n $e ]] || return 1
+  [[ $e =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]] || return 1
+  is_forbidden_email "$e" && return 1
+  return 0
+}
+
+read_email_interactive() {
+  local e
+  while true; do
+    read -rp "Let's Encrypt 账户邮箱（用于到期提醒，不能填 example.com 之类占位域）: " e
+    [[ -n $e ]] || { warn "邮箱不能为空"; continue; }
+    if is_forbidden_email "$e"; then
+      warn "LE 明确拒绝保留域名邮箱（example.com / *.test / *.invalid 等），换一个真实域名"
+      continue
+    fi
+    if ! is_valid_email "$e"; then
+      warn "邮箱格式不对: $e"
+      continue
+    fi
+    printf '%s\n' "$e" > "$EMAIL_FILE"
+    chmod 600 "$EMAIL_FILE"
+    ok "邮箱已保存: $e"
+    printf '%s' "$e"
+    return 0
+  done
+}
+
+# acme.sh 自己把邮箱存在 account.conf 里。只改 /etc/selfcdn/email 不生效，
+# 旧的坏邮箱会继续被用，所以必须同步过去。
+sync_acme_email() {
+  local email=$1
+  [[ -n $email && -d $ACME_HOME ]] || return 0
+  local acct=$ACME_HOME/account.conf
+  if [[ -f $acct ]]; then
+    # 邮箱里不该有 sed 分隔符 / 引号；is_valid_email 已挡掉，这里再兜一层
+    local bad_pipe='|' bad_sq="'"
+    if [[ $email == *"$bad_pipe"* || $email == *"$bad_sq"* ]]; then
+      warn "邮箱含异常字符，跳过 account.conf 同步"
+      return 0
+    fi
+    if grep -q '^ACCOUNT_EMAIL=' "$acct" 2>/dev/null; then
+      sed -i "s|^ACCOUNT_EMAIL=.*|ACCOUNT_EMAIL='$email'|" "$acct"
+      info "已同步 acme.sh 账户邮箱: $email"
+    else
+      printf "ACCOUNT_EMAIL='%s'\n" "$email" >> "$acct"
+    fi
+  fi
+  # 账户若已注册，顺手更新；未注册会失败，忽略
+  if acme_present; then
+    "$ACME_SH" --update-account --accountemail "$email" >/dev/null 2>&1 || true
+  fi
+}
+
+# 返回 0 = 邮箱可用；1 = 需要用户重新输入
+ensure_email() {
   local email
   email=$(cat "$EMAIL_FILE" 2>/dev/null || true)
+
+  # 历史遗留的坏邮箱：文件里或 acme.sh 里都可能存在
+  if [[ -n $email ]] && ! is_valid_email "$email"; then
+    warn "已保存的邮箱不可用: $email"
+    is_forbidden_email "$email" && warn "LE 拒绝保留域名（example.com 等），必须换真实域名邮箱"
+    email=$(read_email_interactive) || return 1
+  fi
   if [[ -z $email ]]; then
     echo
-    read -rp "Let's Encrypt 账户邮箱（用于到期提醒）: " email
-    [[ -n $email ]] || die "邮箱不能为空"
-    echo "$email" > "$EMAIL_FILE"
-    chmod 600 "$EMAIL_FILE"
+    email=$(read_email_interactive) || return 1
   fi
+  sync_acme_email "$email"
+  return 0
+}
+
+ensure_acme() {
+  # 每次都要校验邮箱：acme.sh 已装时也可能带着历史坏邮箱
+  ensure_email || return 1
+  acme_present && return 0
+
+  local email
+  email=$(cat "$EMAIL_FILE" 2>/dev/null || true)
   info "安装 acme.sh ..."
   curl -fsS https://get.acme.sh | sh -s "email=$email" >/dev/null 2>&1 \
     || die "acme.sh 安装失败（检查出网）"
   acme_present || die "acme.sh 未安装成功（预期路径 $ACME_SH）"
   "$ACME_SH" --set-default-ca --server "$ACME_URL" >/dev/null 2>&1 || true
+  sync_acme_email "$email"
   ok "acme.sh 就绪（$ACME_HOME）"
 }
 
@@ -720,10 +811,55 @@ smoke_check_node() {
 }
 
 # ---------------------------------------------------------------- 证书
+ACME_LOG=/tmp/selfcdn-acme.log
+
+# 把 acme.sh 的失败翻译成人能看懂的原因，而不是一律甩"DNS 没生效"
+diagnose_acme_failure() {
+  local log=$1 domain=$2
+  local detail
+  detail=$(grep -E '"(detail|type)"[[:space:]]*:' "$log" 2>/dev/null | head -4)
+
+  if grep -q 'invalidContact\|forbidden domain' "$log" 2>/dev/null; then
+    err "证书申请失败：ACME 拒绝了账户邮箱"
+    [[ -n $detail ]] && sed 's/^/      /' <<< "$detail" >&2
+    echo "    真实域名邮箱不能是 example.com / *.test / *.invalid 这类保留域名。" >&2
+    echo "    改法：cdn → 菜单 11 重设邮箱，再回菜单 4 重新申请" >&2
+    return 0
+  fi
+  if grep -qi 'rateLimited\|too many.*certificate\|too many.*identifiers' "$log" 2>/dev/null; then
+    err "证书申请失败：触发 Let's Encrypt 频率限制"
+    [[ -n $detail ]] && sed 's/^/      /' <<< "$detail" >&2
+    echo "    同一域名每周有签发上限。等一段时间，或先用 --staging 调试。" >&2
+    return 0
+  fi
+  if grep -qi 'DNS problem\|NXDOMAIN\|no valid A records\|dns lookup' "$log" 2>/dev/null; then
+    err "证书申请失败：域名解析问题"
+    [[ -n $detail ]] && sed 's/^/      /' <<< "$detail" >&2
+    echo "    确认 $domain 的 A 记录已指向本机，且已生效（dig +short $domain）。" >&2
+    return 0
+  fi
+  if grep -qi 'connection refused\|timeout\|Connection reset\|port 80' "$log" 2>/dev/null; then
+    err "证书申请失败：80 端口不可达"
+    [[ -n $detail ]] && sed 's/^/      /' <<< "$detail" >&2
+    echo "    安全组 / 防火墙未放通 80，或运营商封了 80。" >&2
+    return 0
+  fi
+
+  err "证书申请失败：$domain"
+  [[ -n $detail ]] && sed 's/^/      /' <<< "$detail" >&2
+  echo "    完整日志: $log（acme.sh 原始输出）" >&2
+  echo "    其他常见原因：A 记录未生效 / 域名未备案被拦" >&2
+}
+
+acme_log_is_fatal() {
+  # 账户类/频率类错误重试也没用，不必再降级 standalone
+  grep -qE 'invalidContact|forbidden domain|rateLimited|too many.*certificate' "$1" 2>/dev/null
+}
+
 issue_cert() {
   local name=$1 mode=${2:-webroot}
   load_node "$name"
-  ensure_acme
+  ensure_acme || return 1
 
   local dns_ip server_ip
   dns_ip=$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')
@@ -749,27 +885,32 @@ issue_cert() {
 
   info "申请证书 [$mode/$verb]: $DOMAIN"
   local rc=1
+
   if [[ $verb == renew ]]; then
-    "$ACME_SH" --renew -d "$DOMAIN" --ecc --server "$ACME_URL" && rc=0
+    "$ACME_SH" --renew -d "$DOMAIN" --ecc --server "$ACME_URL" > "$ACME_LOG" 2>&1 && rc=0
     # 未到续期窗口时 renew 返回非 0，但证书仍有效 —— 继续走 install
     [[ -f "$ACME_HOME/${DOMAIN}_ecc/${DOMAIN}.cer" ]] && rc=0
   elif [[ $mode == webroot ]]; then
-    "$ACME_SH" "${arr[@]}" -w "$ACME_ROOT" && rc=0
+    "$ACME_SH" "${arr[@]}" -w "$ACME_ROOT" > "$ACME_LOG" 2>&1 && rc=0
     if (( rc != 0 )); then
+      if acme_log_is_fatal "$ACME_LOG"; then
+        # 邮箱/频率问题换校验方式也没用，直接报原因
+        diagnose_acme_failure "$ACME_LOG" "$DOMAIN"
+        return 1
+      fi
       warn "webroot 失败，降级 standalone 重试 ..."
       if command -v systemctl >/dev/null 2>&1; then systemctl stop nginx 2>/dev/null || true; else nginx -s stop 2>/dev/null || true; fi
-      "$ACME_SH" "${arr[@]}" --standalone && rc=0
+      "$ACME_SH" "${arr[@]}" --standalone > "$ACME_LOG" 2>&1 && rc=0
       if command -v systemctl >/dev/null 2>&1; then systemctl start nginx 2>/dev/null || true; else nginx 2>/dev/null || true; fi
     fi
   else
     if command -v systemctl >/dev/null 2>&1; then systemctl stop nginx 2>/dev/null || true; else nginx -s stop 2>/dev/null || true; fi
-    "$ACME_SH" "${arr[@]}" --standalone && rc=0
+    "$ACME_SH" "${arr[@]}" --standalone > "$ACME_LOG" 2>&1 && rc=0
     if command -v systemctl >/dev/null 2>&1; then systemctl start nginx 2>/dev/null || true; else nginx 2>/dev/null || true; fi
   fi
 
   if (( rc != 0 )); then
-    err "证书申请失败: $DOMAIN"
-    echo "    常见原因：A 记录未生效 / 80 端口被封 / 域名未备案被拦 / 家宽 80 被运营商封禁" >&2
+    diagnose_acme_failure "$ACME_LOG" "$DOMAIN"
     return 1
   fi
 
@@ -1079,9 +1220,27 @@ set_email() {
   local e
   read -rp "Let's Encrypt 账户邮箱: " e
   [[ -n $e ]] || die "邮箱不能为空"
-  echo "$e" > "$EMAIL_FILE"; chmod 600 "$EMAIL_FILE"
+  if is_forbidden_email "$e"; then
+    err "LE 拒绝保留域名邮箱（example.com / *.test / *.invalid 等），换一个真实域名"
+    warn "这个值如果写进去，签发一定会失败"
+    pause
+    return 1
+  fi
+  if ! is_valid_email "$e"; then
+    err "邮箱格式不对: $e"
+    pause
+    return 1
+  fi
+  printf '%s\n' "$e" > "$EMAIL_FILE"; chmod 600 "$EMAIL_FILE"
   ok "已保存: $e"
-  warn "已装 acme.sh 的账户邮箱不会变更；更换需 acme.sh --update-account -m 新邮箱"
+  sync_acme_email "$e"
+  if acme_present; then
+    if "$ACME_SH" --update-account --accountemail "$e" >/dev/null 2>&1; then
+      ok "acme.sh 账户邮箱已更新"
+    else
+      warn "acme.sh 账户尚未注册（或更新失败）；下次签发会用新邮箱自动注册"
+    fi
+  fi
   pause
 }
 
@@ -1177,6 +1336,8 @@ SelfCDN $VERSION — 自建 CDN 边缘节点
   cdn              进菜单（默认）
   cdn --fix-apt    修复失效的 Debian 源并更新索引（EOL / updates / backports 失效时用）
   cdn --check      只做环境检查，不进菜单
+  cdn --set-email <addr>
+                   设置/更换 ACME 账户邮箱（会同步 acme.sh 的 account.conf）
   cdn --version    版本
   cdn --help       本帮助
 EOF
@@ -1195,6 +1356,28 @@ main() {
         err "自动修复失败。当前 sources.list："
         while read -r f; do [[ -n $f ]] && sed 's/^/    /' "$f"; done < <(apt_sources_files)
         exit 1
+      fi
+      exit 0 ;;
+    --set-email)
+      need_root
+      local addr=${2:-}
+      if [[ -z $addr ]]; then
+        addr=$(read_email_interactive) || exit 1
+      else
+        if is_forbidden_email "$addr"; then
+          err "LE 拒绝保留域名邮箱（example.com / *.test / *.invalid 等）"
+          exit 1
+        fi
+        is_valid_email "$addr" || die "邮箱格式不对: $addr"
+        mkdir -p "$BASE"
+        printf '%s\n' "$addr" > "$EMAIL_FILE"; chmod 600 "$EMAIL_FILE"
+        ok "邮箱已保存: $addr"
+      fi
+      sync_acme_email "$addr"
+      if acme_present && "$ACME_SH" --update-account --accountemail "$addr" >/dev/null 2>&1; then
+        ok "acme.sh 账户邮箱已同步"
+      else
+        info "acme.sh 账户尚未注册；下次签发会用该邮箱自动注册"
       fi
       exit 0 ;;
     --check)

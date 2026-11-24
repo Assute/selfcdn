@@ -345,18 +345,48 @@ codename 从 `/etc/os-release` 取，取不到就从现有源的 suite 反推，
 **`nginx -t` 失败**：看输出里指的行。最常见是 80/443 被占用（
 `ss -lntp | grep :80` 找现行监听，通常是自带的 default_server）。
 
-**证书申请失败**：
+**证书申请失败**：脚本现在按原因分类告诉你（邮箱被拒 / 域名解析 / 80 不可达 / 频率限制 / 其他），
+不再一律甩"DNS 没生效"。原始日志在 `/tmp/selfcdn-acme.log`。
 
 ```bash
 # 1. DNS 对不对
 dig +short static.example.com
 # 2. 80 端口通不通（从外面另一台机器）
 curl -v http://static.example.com/.well-known/acme-challenge/test
-# 3. acme.sh 日志
-acme.sh --issue -d static.example.com -w /var/www/selfcdn-acme --debug 2
+# 3. acme.sh 原始输出
+cat /tmp/selfcdn-acme.log
 ```
 
-常见原因按概率排：A 记录没生效 / 安全组没开 80 / 运营商封 80 / 域名未备案被墙 /
+**一个必须知道的坑：`contact email has forbidden domain "example.com"`**
+
+```
+Account registration error: {
+  "type": "urn:ietf:params:acme:error:invalidContact",
+  "detail": "Error validating contact(s) :: contact email has forbidden domain \"example.com\"",
+  "status": 400
+}
+```
+
+Let's Encrypt 直接拒绝 RFC 2606 保留域名下的联系邮箱：`example.com/net/org/edu`、`*.test`、
+`*.invalid`、`*.localhost`、`*.local`。填这类占位邮箱，账号注册就 400，一张证书都签不出来。
+
+而且**光改 `/etc/selfcdn/email` 不够** —— acme.sh 把邮箱存在自己的
+`/root/.acme.sh/account.conf`（`ACCOUNT_EMAIL=`）里，那个值会一直被沿用。
+本脚本现在会把校验过的邮箱同步过去：
+
+```bash
+cdn --set-email you@yourdomain.com     # 校验 + 写文件 + 同步 acme.sh
+```
+
+也可以菜单 `11`。然后回菜单 `4` 重新申请。
+
+确认 acme.sh 里到底存了什么：
+
+```bash
+grep -E 'ACCOUNT_EMAIL|ACCOUNT_URL' /root/.acme.sh/account.conf
+```
+
+其他常见原因按概率排：A 记录没生效 / 安全组没开 80 / 运营商封 80 / 域名未备案被墙 /
 LE 对该域名多次失败已限流（等一周）。
 
 **缓存不命中**：先 `curl -I` 看 `X-Cache-Status`。
