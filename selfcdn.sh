@@ -287,7 +287,7 @@ pkg_install() {
         if (( refreshed )); then
           return 0
         fi
-        warn "安装成功，但 apt 索引仍不可用；软件源需手工检查（selfcdn --fix-apt）"
+        warn "安装成功，但 apt 索引仍不可用；软件源需手工检查（cdn --fix-apt）"
         return 0
       }
 
@@ -340,7 +340,7 @@ install_deps() {
         echo "      sed -i 's|deb.debian.org/debian|archive.debian.org/debian|g' /etc/apt/sources.list" >&2
         echo "      echo 'Acquire::Check-Valid-Until \"false\";' > /etc/apt/apt.conf.d/99archive" >&2
         echo "      apt-get update && apt-get install -y ${miss[*]}" >&2
-        echo "    或直接: selfcdn --fix-apt" >&2
+        echo "    或直接: cdn --fix-apt" >&2
       fi
       die "请修复软件源后重试"
     fi
@@ -1174,11 +1174,11 @@ usage() {
 SelfCDN $VERSION — 自建 CDN 边缘节点
 
 用法:
-  selfcdn              进菜单（默认）
-  selfcdn --fix-apt    修复已 EOL 的 Debian 源（切 archive.debian.org）并更新索引
-  selfcdn --check      只做环境检查，不进菜单
-  selfcdn --version    版本
-  selfcdn --help       本帮助
+  cdn              进菜单（默认）
+  cdn --fix-apt    修复失效的 Debian 源并更新索引（EOL / updates / backports 失效时用）
+  cdn --check      只做环境检查，不进菜单
+  cdn --version    版本
+  cdn --help       本帮助
 EOF
 }
 

@@ -19,22 +19,22 @@ Debian / Ubuntu / RHEL / CentOS / Rocky / Alma，**root** 跑：
 bash <(curl -fsSL https://raw.githubusercontent.com/Assute/selfcdn/main/install.sh)
 ```
 
-`install.sh` 会把 `selfcdn.sh` 下到 `/usr/local/sbin/selfcdn`（做完整性 + 语法校验），
-装完直接进菜单。之后随时 `selfcdn` 回车。
+`install.sh` 会把 `selfcdn.sh` 下到 `/usr/local/sbin/cdn`（做完整性 + 语法校验），并建 `selfcdn` 软链兼容旧名。
+装完直接进菜单。之后随时 `cdn` 回车。
 
 其他用法：
 
 ```bash
-selfcdn --fix-apt     # 修复过时 Debian 源并更新索引（EOL / updates / backports 失效时用）
-selfcdn --check       # 只做环境检查，不进菜单
-selfcdn --version
+cdn --fix-apt     # 修复失效的 Debian 源并更新索引（EOL / updates / backports 失效时用）
+cdn --check       # 只做环境检查，不进菜单
+cdn --version
 ```
 
 不放心进程替换，分两步：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Assute/selfcdn/main/selfcdn.sh -o /usr/local/sbin/selfcdn
-chmod +x /usr/local/sbin/selfcdn && selfcdn
+curl -fsSL https://raw.githubusercontent.com/Assute/selfcdn/main/selfcdn.sh -o /usr/local/sbin/cdn
+chmod +x /usr/local/sbin/cdn && cdn
 ```
 
 只跑一次不安装：
@@ -157,7 +157,7 @@ firewall-cmd --permanent --add-service={http,https} && firewall-cmd --reload
 ## 常用运维
 
 ```bash
-selfcdn                                   # 进菜单
+cdn                                       # 进菜单
 nginx -t && systemctl reload nginx         # 手工验配置+重载
 curl -I https://static.example.com/       # 看 X-Cache-Status / X-CDN-Node
 tail -f /var/log/nginx/selfcdn-edge1.access.log
@@ -322,7 +322,7 @@ E: Unable to fetch some archives, maybe run apt-get update or try with --fix-mis
 前两级备份成 `*.selfcdn.bak`，第三级另存 `*.selfcdn.bak2`。手动触发：
 
 ```bash
-selfcdn --fix-apt
+cdn --fix-apt
 ```
 
 改坏了回滚：
@@ -386,7 +386,7 @@ LE 对该域名多次失败已限流（等一周）。
 彻底删干净：
 
 ```bash
-selfcdn          # 菜单 12
+cdn              # 菜单 12
 apt remove nginx || dnf remove nginx
 rm -rf /root/.acme.sh
 crontab -l | grep -v acme | crontab -

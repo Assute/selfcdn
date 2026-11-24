@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # language: bash, file: install.sh
-# SelfCDN 一键安装：拉取脚本到 /usr/local/sbin/selfcdn 并执行
+# SelfCDN 一键安装：拉取脚本到 /usr/local/sbin/cdn 并执行
 set -euo pipefail
 
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/Assute/selfcdn/main/selfcdn.sh}"
-DEST="${DEST:-/usr/local/sbin/selfcdn}"
+BINDIR="${BINDIR:-/usr/local/sbin}"
+DEST="${DEST:-$BINDIR/cdn}"
+# 旧命令名保留为软链，避免已装过 selfcdn 的机器留下过期副本
+LEGACY="$BINDIR/selfcdn"
 
 R='\033[31m'; G='\033[32m'; Y='\033[33m'; B='\033[36m'; N='\033[0m'
 info() { printf "${B}[*]${N} %s\n" "$*"; }
@@ -40,19 +43,39 @@ done
 got_ver=$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)
 info "版本: ${got_ver:-未知}"
 
+mkdir -p "$BINDIR"
 install -m 755 "$tmp" "$DEST"
 ok "已安装: $DEST"
+
+# 旧名做成软链；若 $LEGACY 已存在且不是指向我们的软链，先清掉再链
+if [[ $LEGACY != "$DEST" ]]; then
+  if [[ -e $LEGACY && ! -L $LEGACY ]]; then
+    rm -f "$LEGACY"
+  fi
+  if ln -sfn "$DEST" "$LEGACY" 2>/dev/null; then
+    ok "兼容软链: $LEGACY -> $DEST"
+  fi
+fi
+
+if ! command -v cdn >/dev/null 2>&1; then
+  err "$BINDIR 不在 PATH 里，请用绝对路径 $DEST，或把 $BINDIR 加进 PATH"
+fi
 
 cat <<EOF
 
   用法：
-    selfcdn              # 进菜单
-    sudo selfcdn         # 非 root 登录时
+    cdn              # 进菜单
+    sudo cdn         # 非 root 登录时
+
+  常用：
+    cdn --check      # 只做环境检查，不进菜单
+    cdn --fix-apt    # 软件源失效时修复并更新索引
+    cdn --version
 
   下一步：
     1. 确认域名 A 记录已指向本机
     2. 确认 80 / 443 已放通（安全组 + 防火墙）
-    3. selfcdn → 选 1 添加节点
+    3. cdn → 选 1 添加节点
 
 EOF
 
