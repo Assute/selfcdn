@@ -52,6 +52,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Assute/selfcdn/main/selfcdn.
 > jsDelivr，最后才退到可能滞后的裸 raw。安装时会打印来源和版本号，
 > 并校验关键函数是否齐全，拿到串版或截断内容直接拒绝安装。
 >
+> 刚 push 完想立刻装？外层这条 `install.sh` 的 URL 本身也在那 5 分钟缓存里。
+> 用 SHA 直取可以完全绕开：
+>
+> ```bash
+> SHA=$(curl -fsSL https://api.github.com/repos/Assute/selfcdn/commits/main | grep -m1 '"sha"' | cut -d'"' -f4)
+> bash <(curl -fsSL "https://raw.githubusercontent.com/Assute/selfcdn/$SHA/install.sh")
+> ```
+>
 > 要确认自己装的是哪个提交：
 >
 > ```bash
