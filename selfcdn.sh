@@ -4,7 +4,7 @@
 # target: Debian/Ubuntu · RHEL/CentOS/Rocky/Alma · 需 root
 set -uo pipefail
 
-VERSION="1.1.4"
+VERSION="1.1.5"
 
 BASE=/etc/selfcdn
 NODES_DIR=$BASE/nodes
@@ -1102,27 +1102,75 @@ plain_list() {
   done < <(list_node_names)
 }
 
-list_nodes() {
-  local names n idx=0
-  names=$(list_node_names)
-  if [[ -z $names ]]; then echo; echo "（暂无节点）"; pause; return; fi
-  echo
-  printf "%-4s %-12s %-32s %-26s %-6s %s\n" "#" "标识" "域名" "回源" "缓存" "证书剩余"
-  printf '%s\n' "--------------------------------------------------------------------------------------------------------"
+# 编号表格：list_nodes 与所有"选节点"的提示共用
+NODE_PICK_NAMES=()
+
+render_node_table() {
+  NODE_PICK_NAMES=()
+  local -a all=()
+  local n
   while read -r n; do
-    [[ -z $n ]] && continue
+    [[ -n $n ]] && all+=("$n")
+  done < <(list_node_names)
+
+  if (( ${#all[@]} == 0 )); then
+    echo "（暂无节点）"
+    return 1
+  fi
+
+  echo
+  printf "%-4s %-12s %-30s %-24s %-6s %s\n" "#" "标识" "域名" "回源" "缓存" "证书剩余"
+  printf '%s\n' "--------------------------------------------------------------------------------------------------------------"
+  local i=0
+  for n in "${all[@]}"; do
+    i=$((i+1))
     # shellcheck disable=SC1090
     source "$(node_file "$n")"
-    idx=$((idx+1))
     local ce=off; [[ ${CACHE_ENABLE:-0} == 1 ]] && ce=on
     local cert="未签发"
-    # 证书必须与当前域名匹配，换域名后旧证书不算有效
     if [[ -f "$CERT_DIR/$n/fullchain.cer" && -f "$CERT_DIR/$n/$DOMAIN.key" ]]; then
       cert=$(cert_state_text "$CERT_DIR/$n/fullchain.cer")
     fi
-    printf "%-4s %-12s %-32s %-26s %-6s %s\n" "$idx" "$n" "$DOMAIN" "$UPSTREAMS" "$ce" "$cert"
-  done <<< "$names"
+    printf "%-4s %-12s %-30s %-24s %-6s %s\n" "$i" "$n" "$DOMAIN" "$UPSTREAMS" "$ce" "$cert"
+    NODE_PICK_NAMES+=("$n")
+  done
   echo
+  return 0
+}
+
+# 按序号选节点。结果写进全局 PICKED_NODE，不用 $( ) 捕获 ——
+# 否则表格与警告会被一起吞进变量里。
+PICKED_NODE=""
+pick_node() {
+  local prompt=${1:-请选择序号} allow_all=${2:-0} choice
+  render_node_table || return 1
+
+  while true; do
+    printf '%s（0 取消）: ' "$prompt"
+    if ! read -r choice; then
+      echo
+      return 1
+    fi
+    [[ $choice == 0 ]] && { echo "已取消"; return 1; }
+    if (( allow_all )) && [[ $choice == all ]]; then
+      PICKED_NODE=all
+      return 0
+    fi
+    if ! [[ $choice =~ ^[0-9]+$ ]]; then
+      printf '\033[33m[!]\033[0m 请输入序号数字，或 0 取消\n' >&2
+      continue
+    fi
+    if (( choice < 1 || choice > ${#NODE_PICK_NAMES[@]} )); then
+      printf '\033[33m[!]\033[0m 序号超出范围：1-%s\n' "${#NODE_PICK_NAMES[@]}" >&2
+      continue
+    fi
+    PICKED_NODE=${NODE_PICK_NAMES[choice-1]}
+    return 0
+  done
+}
+
+list_nodes() {
+  render_node_table || { pause; return; }
   pause
 }
 
@@ -1131,8 +1179,8 @@ del_node() {
   local names n
   names=$(list_node_names)
   [[ -z $names ]] && { echo "（暂无节点）"; pause; return; }
-  plain_list
-  read -rp "要删除的节点标识: " n
+  pick_node "要删除的节点序号" || { pause; return 0; }
+  n=$PICKED_NODE
   node_exists "$n" || die "节点不存在: $n"
   load_node "$n"
   read -rp "确认删除 $n（$DOMAIN，含证书与缓存）？输入 yes: " c
@@ -1157,8 +1205,8 @@ del_node() {
 # ---------------------------------------------------------------- 功能 4 单节点证书
 issue_one() {
   local n
-  plain_list
-  read -rp "节点标识: " n
+  pick_node "要给哪个节点申请/续期证书" || { pause; return 0; }
+  n=$PICKED_NODE
   node_exists "$n" || die "节点不存在: $n"
   if issue_cert "$n" webroot; then
     gen_node_conf "$n"
@@ -1184,8 +1232,8 @@ renew_all() {
 # ---------------------------------------------------------------- 功能 6 清缓存
 purge_cache() {
   local n
-  plain_list
-  read -rp "节点标识（all = 全部）: " n
+  pick_node "要清缓存的节点序号（也可输入 all 清全部）" 1 || { pause; return 0; }
+  n=$PICKED_NODE
   if [[ $n == all ]]; then
     rm -rf "${CACHE_ROOT:?}"/* 2>/dev/null || true
     ok "全部节点缓存已清空"
@@ -1200,8 +1248,8 @@ purge_cache() {
 # ---------------------------------------------------------------- 功能 8 查看配置
 show_node() {
   local n
-  plain_list
-  read -rp "节点标识: " n
+  pick_node "节点序号" || { pause; return 0; }
+  n=$PICKED_NODE
   node_exists "$n" || die "节点不存在: $n"
   echo; echo "===== 节点登记 $NODES_DIR/$n.conf ====="
   sed 's/^/  /' "$(node_file "$n")"
@@ -1225,8 +1273,8 @@ show_node() {
 # ---------------------------------------------------------------- 功能 9 日志/命中率
 show_logs() {
   local n
-  plain_list
-  read -rp "节点标识: " n
+  pick_node "节点序号" || { pause; return 0; }
+  n=$PICKED_NODE
   node_exists "$n" || die "节点不存在: $n"
   local acc="/var/log/nginx/selfcdn-$n.access.log"
   local erl="/var/log/nginx/selfcdn-$n.error.log"

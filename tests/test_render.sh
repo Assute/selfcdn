@@ -177,6 +177,69 @@ assert "main 用 render_global_conf"     bash -c "awk '/^main\\(\\)/,/^}/' '$SRC
 assert "无用旧函数 write_global_conf 分叉" bash -c "! awk '/^write_global_conf\\(\\)/,/^}/' '$SRC' | grep -q 'proxy_cache_path'"
 
 
+# --- 用例 F: 按序号选节点（pick_node）
+echo
+echo "[F] 节点选择改为按序号"
+NODES_DIR=$TMP/fnodes
+CERT_DIR=$TMP/fcerts
+mkdir -p "$NODES_DIR" "$CERT_DIR"
+mk_fnode() {
+  printf 'NAME=%s\nDOMAIN=%s\nUPSTREAMS=%s\nUPSTREAM_SCHEME=http\nPROXY_HOST=\\$host\nCACHE_ENABLE=0\nCACHE_TTL=24h\nCACHE_SIZE=1g\nCACHE_MEM=10m\nCLIENT_MAX_BODY=1m\nTLS_MODE=acme\n' \
+    "$1" "$2" "10.0.0.9:80" > "$NODES_DIR/$1.conf"
+}
+mk_fnode a1   a1.test
+mk_fnode b2   b2.test
+mk_fnode c3   c3.test
+
+TABLE=$(render_node_table 2>&1)
+printf '%s\n' "$TABLE" | grep -vE '^$' | sed 's/^/    /'
+grep -q '^#  ' <<< "$TABLE" \
+  && { echo "  PASS  表格有编号列"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  表格无编号列"; FAIL=$((FAIL+1)); }
+for nm in a1 b2 c3; do
+  assert "表格列出 $nm" grep -qw "$nm" <<< "$TABLE"
+done
+
+t_pick() {  # t_pick <描述> <期望> <输入> [allow_all] <期望成功0/失败1>
+  local desc=$1 want=$2 input=$3 allow=${4:-0} wantrc=${5:-0} rc
+  PICKED_NODE=""
+  pick_node "选" "$allow" <<< "$input" >/dev/null 2>&1
+  rc=$?
+  if [[ $rc -eq $wantrc && $PICKED_NODE == "$want" ]]; then
+    echo "  PASS  $desc"; PASS=$((PASS+1))
+  else
+    echo "  FAIL  $desc  (rc=$rc want=$wantrc, got='$PICKED_NODE' want='$want')"; FAIL=$((FAIL+1))
+  fi
+}
+
+t_pick "输 2 选到第 2 个"            "b2" "2"
+t_pick "输 1 选到第 1 个"            "a1" "1"
+t_pick "输 3 选到第 3 个"            "c3" "3"
+t_pick "超范围后重输可用"            "b2" $'9\n2'
+t_pick "非数字后重输可用"            "c3" $'abc\n3'
+t_pick "空行后重输可用"              "a1" $'\n1'
+t_pick "0 取消"                      ""   "0" 0 1
+t_pick "EOF 退出"                    ""   ""  0 1
+t_pick "all 关键字（允许时）"        "all" "all" 1
+t_pick "all 关键字（不允许时被拒）"  "a1" $'all\n1' 0
+
+echo
+echo "  序号与标识对应关系（编号与节点名是两个东西，不能混）"
+PICKED_NODE=""; pick_node "选" <<< "1" >/dev/null 2>&1
+echo "    序号 1 -> '$PICKED_NODE'（节点标识，不是序号）"
+assert "序号1 解析成节点标识 a1"        test "$PICKED_NODE" = "a1"
+assert "pick_node 结果走全局变量而非 stdout" bash -c "! grep -q 'PICKED_NODE=\$(pick_node' '$SRC'"
+# 各"选节点"的函数都必须走 pick_node（add_node 里问的是新节点取名，不算）
+for fn in del_node issue_one purge_cache show_node show_logs; do
+  assert "$fn 用 pick_node 选节点" bash -c "awk '/^$fn\\(\\)/,/^}/' '$SRC' | grep -q 'pick_node'"
+done
+assert "选节点处不再 read 节点标识" bash -c "! grep -qE 'read -rp .节点标识(（all[^）]*）)?: ' '$SRC'"
+
+# 复原
+NODES_DIR=$TMP/n
+CERT_DIR=$TMP/c
+
+
 echo "==================== 结果: PASS=$PASS  FAIL=$FAIL ===================="
 rm -rf "$TMP"
 [[ $FAIL -eq 0 ]] || exit 1
