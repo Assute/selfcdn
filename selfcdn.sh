@@ -4,7 +4,7 @@
 # target: Debian/Ubuntu · RHEL/CentOS/Rocky/Alma · 需 root
 set -uo pipefail
 
-VERSION="1.1.5"
+VERSION="1.2.0"
 
 BASE=/etc/selfcdn
 NODES_DIR=$BASE/nodes
@@ -1091,7 +1091,140 @@ add_node() {
   pause
 }
 
-# ---------------------------------------------------------------- 功能 2 列表
+# 带默认值的提示：回车保持原值。结果写全局 ASK_RESULT。
+ASK_RESULT=""
+ask() {  # ask <提示> <当前值>
+  local prompt=$1 cur=$2 ans
+  printf '%s [%s]: ' "$prompt" "$cur"
+  if ! IFS= read -r ans; then
+    ASK_RESULT=$cur
+    return 0
+  fi
+  if [[ -z $ans ]]; then
+    ASK_RESULT=$cur
+  else
+    ASK_RESULT=$ans
+  fi
+}
+
+# ---------------------------------------------------------------- 功能 2 修改
+edit_node() {
+  local name
+  pick_node "要修改的节点序号" || { pause; return 0; }
+  name=$PICKED_NODE
+  load_node "$name"
+
+  local old_domain=$DOMAIN old_up=$UPSTREAMS old_scheme=$UPSTREAM_SCHEME
+  local old_host=$PROXY_HOST old_cache=$CACHE_ENABLE old_ttl=$CACHE_TTL
+  local old_size=$CACHE_SIZE old_mem=$CACHE_MEM old_body=$CLIENT_MAX_BODY
+
+  echo
+  info "直接回车保持原值；只改想改的那项"
+  echo
+
+  ask "域名" "$DOMAIN"
+  local new_domain=$ASK_RESULT
+  validate_domain "$new_domain" || { err "域名不合法: $new_domain（改动未保存）"; pause; return 1; }
+  DOMAIN=$new_domain
+
+  ask "回源 IP:端口（多个用空格分隔）" "$UPSTREAMS"
+  local raw_up=$ASK_RESULT nu u
+  [[ -n $raw_up ]] || { err "回源地址不能为空"; pause; return 1; }
+  local new_up=""
+  for u in $raw_up; do
+    nu=$(normalize_upstream "$u")
+    [[ $nu =~ ^[^:]+:[0-9]+$ ]] || { err "回源格式错误: $u（改动未保存）"; pause; return 1; }
+    new_up+="$nu "
+  done
+  UPSTREAMS=${new_up% }
+
+  ask "回源协议 http/https" "$UPSTREAM_SCHEME"
+  UPSTREAM_SCHEME=$ASK_RESULT
+  [[ $UPSTREAM_SCHEME == http || $UPSTREAM_SCHEME == https ]] \
+    || { err "协议只能是 http 或 https（改动未保存）"; pause; return 1; }
+
+  ask "回源 Host 头" "$PROXY_HOST"
+  PROXY_HOST=$ASK_RESULT
+
+  local cur_cache=Y; [[ ${CACHE_ENABLE:-0} == 1 ]] || cur_cache=n
+  ask "启用缓存 Y/n" "$cur_cache"
+  case $ASK_RESULT in
+    [Yy]|yes|YES) CACHE_ENABLE=1 ;;
+    [Nn]|no|NO)   CACHE_ENABLE=0 ;;
+    *) err "只能填 Y 或 n（改动未保存）"; pause; return 1 ;;
+  esac
+
+  if [[ $CACHE_ENABLE == 1 ]]; then
+    ask "缓存有效期 TTL" "$CACHE_TTL";   CACHE_TTL=$ASK_RESULT
+    ask "缓存磁盘上限" "$CACHE_SIZE";    CACHE_SIZE=$ASK_RESULT
+    ask "缓存内存索引" "$CACHE_MEM";     CACHE_MEM=$ASK_RESULT
+  fi
+  ask "最大请求体" "$CLIENT_MAX_BODY";   CLIENT_MAX_BODY=$ASK_RESULT
+
+  # ---- 汇总改动 ----
+  local -a diffs=()
+  [[ $old_domain != "$DOMAIN" ]]            && diffs+=("域名: $old_domain → $DOMAIN")
+  [[ $old_up != "$UPSTREAMS" ]]             && diffs+=("回源: $old_up → $UPSTREAMS")
+  [[ $old_scheme != "$UPSTREAM_SCHEME" ]]   && diffs+=("协议: $old_scheme → $UPSTREAM_SCHEME")
+  [[ $old_host != "$PROXY_HOST" ]]          && diffs+=("Host 头: $old_host → $PROXY_HOST")
+  [[ $old_cache != "$CACHE_ENABLE" ]]       && diffs+=("缓存: $old_cache → $CACHE_ENABLE")
+  [[ $old_ttl != "$CACHE_TTL" ]]            && diffs+=("TTL: $old_ttl → $CACHE_TTL")
+  [[ $old_size != "$CACHE_SIZE" ]]          && diffs+=("磁盘上限: $old_size → $CACHE_SIZE")
+  [[ $old_mem != "$CACHE_MEM" ]]            && diffs+=("内存索引: $old_mem → $CACHE_MEM")
+  [[ $old_body != "$CLIENT_MAX_BODY" ]]     && diffs+=("请求体上限: $old_body → $CLIENT_MAX_BODY")
+
+  echo
+  if (( ${#diffs[@]} == 0 )); then
+    info "没有改动"
+    pause
+    return 0
+  fi
+  echo "  即将修改 $name:"
+  local d
+  for d in "${diffs[@]}"; do echo "    - $d"; done
+  local a
+  read -rp "确认应用？[Y/n]（默认 Y）: " a
+  [[ $a =~ ^[Nn]$ ]] && { warn "已取消，未写入"; pause; return 0; }
+
+  save_node "$name"
+
+  # 换域名：清掉不匹配的旧私钥，避免 gen_node_conf 误判
+  local f
+  for f in "$CERT_DIR/$name"/*.key; do
+    [[ -e $f ]] || continue
+    [[ $(basename "$f") == "$DOMAIN.key" ]] || { rm -f "$f"; info "已清理旧域名私钥: $(basename "$f")"; }
+  done
+
+  render_global_conf
+  gen_node_conf "$name"
+  nginx_test || { err "配置测试失败，改动已写入但未生效，请手工检查"; pause; return 1; }
+  nginx_reload || { err "重载失败"; pause; return 1; }
+  smoke_check_node "$name"
+
+  if node_conf_is_https "$name"; then
+    ok "已生效: https://$DOMAIN"
+  else
+    ok "已生效: http://$DOMAIN（该域名还没有可用证书，仍是 HTTP 引导模式）"
+    local b
+    read -rp "现在为该域名申请证书？[Y/n]（默认 Y）: " b
+    if [[ ! $b =~ ^[Nn]$ ]]; then
+      if issue_cert "$name" webroot; then
+        gen_node_conf "$name"
+        if nginx_reload; then
+          smoke_check_node "$name"
+          ok "已切到 HTTPS: https://$DOMAIN"
+        else
+          err "HTTPS 配置重载失败，节点仍停在 HTTP"
+        fi
+      else
+        warn "证书未签；稍后可用菜单申请/续期"
+      fi
+    fi
+  fi
+  pause
+}
+
+# ---------------------------------------------------------------- 功能 3 列表
 plain_list() {
   local n
   while read -r n; do
@@ -1415,18 +1548,19 @@ main_menu() {
   while true; do
     banner
     cat <<MENU
-   1) 添加 / 更新 CDN 节点
-   2) 列出全部节点
-   3) 删除节点
-   4) 申请 / 续期单节点证书
-   5) 全部续期
-   6) 清理缓存
-   7) 重载 Nginx
-   8) 查看节点配置
-   9) 查看日志 / 命中率
-  10) 运行状态总览
-  11) 设置 ACME 邮箱
-  12) 清空全部节点
+   1) 添加 CDN 节点
+   2) 修改节点（逐项改，回车保持）
+   3) 列出全部节点
+   4) 删除节点
+   5) 申请 / 续期单节点证书
+   6) 全部续期
+   7) 清理缓存
+   8) 重载 Nginx
+   9) 查看节点配置
+  10) 查看日志 / 命中率
+  11) 运行状态总览
+  12) 设置 ACME 邮箱
+  13) 清空全部节点
    0) 退出
 
 MENU
@@ -1440,19 +1574,20 @@ MENU
     fi
     case ${choice:-} in
       1)  add_node ;;
-      2)  list_nodes ;;
-      3)  del_node ;;
-      4)  issue_one ;;
-      5)  renew_all ;;
-      6)  purge_cache ;;
-      7)
+      2)  edit_node ;;
+      3)  list_nodes ;;
+      4)  del_node ;;
+      5)  issue_one ;;
+      6)  renew_all ;;
+      7)  purge_cache ;;
+      8)
           nginx_test && nginx_reload
           pause ;;
-      8)  show_node ;;
-      9)  show_logs ;;
-      10) show_status ;;
-      11) set_email ;;
-      12) uninstall_all ;;
+      9)  show_node ;;
+      10) show_logs ;;
+      11) show_status ;;
+      12) set_email ;;
+      13) uninstall_all ;;
       0|q|Q) ok "bye"; exit 0 ;;
       *)  warn "无效序号: $choice"; pause ;;
     esac

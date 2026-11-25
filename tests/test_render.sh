@@ -240,6 +240,81 @@ NODES_DIR=$TMP/n
 CERT_DIR=$TMP/c
 
 
+# --- 用例 G: 修改节点（逐项改 + 回车保持）
+echo
+echo "[G] 修改节点"
+NODES_DIR=$TMP/gnodes
+CERT_DIR=$TMP/gcerts
+mkdir -p "$NODES_DIR" "$CERT_DIR"
+printf 'NAME=e1\nDOMAIN=e1.test\nUPSTREAMS=10.1.1.1:80\nUPSTREAM_SCHEME=http\nPROXY_HOST=\\$host\nCACHE_ENABLE=0\nCACHE_TTL=24h\nCACHE_SIZE=5g\nCACHE_MEM=100m\nCLIENT_MAX_BODY=100m\nTLS_MODE=acme\n' > "$NODES_DIR/e1.conf"
+
+# ask()：回车保持原值，输入则替换
+ASK_RESULT=""
+ask "域名" "keep.test" <<< "" >/dev/null 2>&1
+assert "ask 回车保持原值"           test "$ASK_RESULT" = "keep.test"
+ASK_RESULT=""
+ask "域名" "keep.test" <<< "new.test" >/dev/null 2>&1
+assert "ask 输入则替换"             test "$ASK_RESULT" = "new.test"
+ASK_RESULT=""
+ask "Host 头" '$host' <<< "" >/dev/null 2>&1
+assert "ask 保留 Host 变量不展开" test "$ASK_RESULT" = '$host'
+ASK_RESULT=""
+ask "TTL" "24h" <<< "" >/dev/null 2>&1
+assert "ask EOF 时保持原值"          test "$ASK_RESULT" = "24h"
+
+# 修改后的登记文件往返
+load_node e1
+assert "读回原域名"                 test "$DOMAIN" = "e1.test"
+assert "读回原缓存开关"             test "$CACHE_ENABLE" = "0"
+assert "读回原 Host 变量"           test "$PROXY_HOST" = '$host'
+
+# 模拟逐项修改：只改回源与缓存，其余回车
+DOMAIN=e1.test
+ask "域名" "$DOMAIN" <<< "" >/dev/null 2>&1;                      DOMAIN=$ASK_RESULT
+UPSTREAMS=10.1.1.1:80
+ask "回源" "$UPSTREAMS" <<< "10.2.2.2:8080 10.3.3.3:8080" >/dev/null 2>&1; UPSTREAMS=$ASK_RESULT
+UPSTREAM_SCHEME=http
+ask "协议" "$UPSTREAM_SCHEME" <<< "" >/dev/null 2>&1;             UPSTREAM_SCHEME=$ASK_RESULT
+PROXY_HOST='$host'
+ask "Host" "$PROXY_HOST" <<< "" >/dev/null 2>&1;                  PROXY_HOST=$ASK_RESULT
+CACHE_ENABLE=1
+CACHE_TTL=6h; CACHE_SIZE=2g; CACHE_MEM=50m; CLIENT_MAX_BODY=100m
+save_node e1
+load_node e1
+assert "域名未被回车改掉"           test "$DOMAIN" = "e1.test"
+assert "回源已更新为双上游"         test "$UPSTREAMS" = "10.2.2.2:8080 10.3.3.3:8080"
+assert "缓存开关已改为 1"           test "$CACHE_ENABLE" = "1"
+assert "TTL 已更新"                test "$CACHE_TTL" = "6h"
+assert "Host 变量仍完整"           test "$PROXY_HOST" = '$host'
+
+# 缓存打开后 zone 必须出现；关掉后必须消失
+render_global_conf
+assert "缓存开启后生成 zone"        grep -q 'keys_zone=cdn_e1' "$GLOBAL_CONF"
+sed -i 's/^CACHE_ENABLE=.*/CACHE_ENABLE=0/' "$NODES_DIR/e1.conf"
+render_global_conf
+assert_not_z() { bash -c "! grep -q 'keys_zone=cdn_e1' '$GLOBAL_CONF'"; }
+assert "缓存关闭后 zone 消失"       assert_not_z
+
+# 配置生成仍正确
+gen_node_conf e1 >/dev/null 2>&1
+CONF_G=$NGINX_CONF_D/selfcdn-e1.conf
+assert "双上游都写进 upstream 块"    grep -q 'server 10.2.2.2:8080' "$CONF_G"
+assert "第二个上游也在"             grep -q 'server 10.3.3.3:8080' "$CONF_G"
+assert "缓存关闭后无 proxy_cache"   bash -c "! grep -q 'proxy_cache cdn_e1' '$CONF_G'"
+
+# 菜单结构：修改节点必须存在且是第 2 项
+assert "菜单含修改节点"             grep -q '2) 修改节点' "$SRC"
+assert "case 分支 2 走 edit_node"   grep -qE '^\s+2\)\s+edit_node' "$SRC"
+assert "edit_node 用 pick_node"     bash -c "awk '/^edit_node\\(\\)/,/^}/' '$SRC' | grep -q 'pick_node'"
+assert "edit_node 会重渲染全局缓存区" bash -c "awk '/^edit_node\\(\\)/,/^}/' '$SRC' | grep -q 'render_global_conf'"
+assert "edit_node 有 nginx -t 卡关"  bash -c "awk '/^edit_node\\(\\)/,/^}/' '$SRC' | grep -q 'nginx_test'"
+assert "edit_node 不提供改名"        bash -c "! awk '/^edit_node\\(\\)/,/^}/' '$SRC' | grep -q 'ask \"节点标识'"
+
+# 复原
+NODES_DIR=$TMP/n
+CERT_DIR=$TMP/c
+
+
 echo "==================== 结果: PASS=$PASS  FAIL=$FAIL ===================="
 rm -rf "$TMP"
 [[ $FAIL -eq 0 ]] || exit 1
